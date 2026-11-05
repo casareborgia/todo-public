@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 로컬 사용자 데이터 (업무 내역 포함)
+todo_data.db
+todo_data.db-journal
+# 감시 폴더에 넣은 실제 업무 파일 (빈 폴더 표시용 .gitkeep만 저장소에 둠)
+scan_inbox/*
+!scan_inbox/.gitkeep
+
+# PyInstaller 빌드 산출물
+build/
+dist/
+*.spec

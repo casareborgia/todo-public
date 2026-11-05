@@ -1,0 +1,64 @@
+{
+  "app_name": "사내 업무 캘린더 & 투두 매니저",
+  "version": "1.4.0",
+  "watch_folders": [
+    "./scan_inbox"
+  ],
+  "scan_interval_seconds": 15,
+  "reminder_check_seconds": 30,
+  "show_startup_briefing": true,
+  "ezq_auto_collect": true,
+  "ezq_window_class": "TfrmReceiveMessage",
+  "ezq_check_seconds": 3,
+  "workmgmt_auto_collect": true,
+  "workmgmt_window_class": "Chrome_WidgetWin_1|IEFrame",
+  "default_deadline_days_if_missing": 3,
+  "default_deadline_time": "18:00",
+  "labels": {
+    "PORTAL": {
+      "name": "사내포털 문서",
+      "color": "#1E88E5",
+      "bg_color": "#E3F2FD"
+    },
+    "MESSENGER": {
+      "name": "사내메신저",
+      "color": "#43A047",
+      "bg_color": "#E8F5E9"
+    },
+    "URGENT": {
+      "name": "긴급/중요",
+      "color": "#E53935",
+      "bg_color": "#FFEBEE"
+    },
+    "MANUAL": {
+      "name": "개인/수동등록",
+      "color": "#8E24AA",
+      "bg_color": "#F3E5F5"
+    },
+    "ROUTINE": {
+      "name": "정기/반복업무",
+      "color": "#FB8C00",
+      "bg_color": "#FFF3E0"
+    }
+  },
+  "keywords": {
+    "task_triggers": [
+      "배부", "협조", "결재", "회신", "제출", "보고", "검토", "요청",
+      "작성", "취합", "확인", "기안", "공람", "시행", "처리", "안내",
+      "점검", "마감", "필수", "부탁", "바랍니다", "주시기"
+    ],
+    "urgent_triggers": [
+      "긴급", "즉시", "조속히", "금일중", "오늘까지", "최우선", "필독", "독촉", "지연"
+    ],
+    "portal_indicators": [
+      "문서번호", "접수번호", "기안자", "발신부서", "수신자", "공문", "업무관리", "온나라", "그룹웨어", "[배부]", "[공문]"
+    ],
+    "messenger_indicators": [
+      "메신저", "쪽지", "대화", "님:", "보낸사람", "[쪽지]", "[대화]"
+    ]
+  },
+  "supported_extensions": [
+    ".txt", ".html", ".htm", ".md", ".log", ".json", ".pdf"
+  ],
+  "holidays": []
+}
