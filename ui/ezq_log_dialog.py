@@ -5,6 +5,7 @@
 점수표를 맞출 정답 표본이 됨.
 """
 
+import re
 import tkinter as tk
 from tkinter import ttk
 from typing import Callable, Dict, List
@@ -31,6 +32,24 @@ def first_line(body: str, width: int = 60) -> str:
     return line if len(line) <= width else line[: width - 1] + "…"
 
 
+DOC_TITLE_RE = re.compile(r"^\s*제\s*목\s*[:：]?\s*(.*)$")
+
+
+def doc_title(body: str, width: int = 60) -> str:
+    """문서 행의 요지: '제 목' 줄(같은 줄 또는 다음 줄)의 공문 제목. 없으면 첫 줄.
+
+    업무관리시스템 본문은 기관 머리말로 시작해 첫 줄로는 문서를 구분할 수 없음.
+    """
+    lines = [ln.strip() for ln in (body or "").splitlines() if ln.strip()]
+    for i, ln in enumerate(lines):
+        m = DOC_TITLE_RE.match(ln)
+        if m:
+            title = m.group(1).strip() or (lines[i + 1] if i + 1 < len(lines) else "")
+            if title:
+                return first_line(title, width)
+    return first_line(body, width)
+
+
 def merged_records(ezq_rows: List[dict], doc_rows: List[dict]) -> List[dict]:
     """쪽지·문서 판정 기록을 받은 시각 내림차순으로 합침. 키가 같을 수 있어 표 iid는 출처를 붙인 row_id."""
     tagged = [
@@ -50,7 +69,7 @@ def row_values(rec: dict) -> tuple:
         rec.get("origin") or ORIGIN_EZQ,
         verdict,
         rec.get("score", 0),
-        first_line(rec.get("body", "")),
+        doc_title(rec.get("body", "")) if rec.get("origin") == ORIGIN_DOC else first_line(rec.get("body", "")),
     )
 
 

@@ -36,6 +36,19 @@ class TestEzqLogDialogRules(unittest.TestCase):
         rec = {"first_seen": "2026-11-03 15:35:00", "verdict": "제외", "score": -2, "body": "공지", "user_label": "업무"}
         self.assertEqual(row_values(rec), ("11-03 15:35", "쪽지", "제외 → 업무", -2, "공지"))
 
+    def test_doc_row_shows_gongmun_title_not_header_line(self):
+        # 업무관리시스템 본문은 기관 머리말로 시작하므로, 문서 행의 요지는 '제 목' 다음의 공문 제목
+        body = "가상 기관 머리말\n수신자 부서별처실\n제 목\n사무실 에너지 절약 지침 송부\n1. 알려드리오니 참고 바랍니다."
+        rec = {"first_seen": "2026-11-06 14:01:00", "verdict": "제외", "score": -2, "body": body, "origin": ORIGIN_DOC}
+        self.assertEqual(row_values(rec)[4], "사무실 에너지 절약 지침 송부")
+        same_line = {**rec, "body": "가상 기관\n제목  정보보호 교육 계획 제출\n본문"}
+        self.assertEqual(row_values(same_line)[4], "정보보호 교육 계획 제출")
+        no_title = {**rec, "body": "가상 기관 머리말\n본문만 있음"}
+        self.assertEqual(row_values(no_title)[4], "가상 기관 머리말")
+        # 쪽지는 그대로 첫 줄 ('제목' 줄이 있어도)
+        note = {**rec, "origin": ORIGIN_EZQ, "body": "안녕하세요\n제목: 회의"}
+        self.assertEqual(row_values(note)[4], "안녕하세요")
+
     def test_merged_records_sorted_and_tagged(self):
         ezq = [{"msg_key": "m1", "first_seen": "2026-11-03 09:00:00", "verdict": "제외", "score": -2, "body": "쪽지"}]
         doc = [{"msg_key": "d1", "first_seen": "2026-11-04 10:00:00", "verdict": "제외", "score": -1, "body": "문서"}]
