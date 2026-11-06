@@ -3,7 +3,17 @@
 import unittest
 
 from core.models import TaskItem, TaskSource
-from ui.ezq_log_dialog import can_register, first_line, review_handler, row_values
+from ui.ezq_log_dialog import (
+    ORIGIN_DOC,
+    ORIGIN_EZQ,
+    VIEWS,
+    can_register,
+    first_line,
+    merged_records,
+    confirm_handler,
+    review_handler,
+    row_values,
+)
 
 
 class TestEzqLogDialogRules(unittest.TestCase):
@@ -24,16 +34,40 @@ class TestEzqLogDialogRules(unittest.TestCase):
 
     def test_row_values_show_user_label(self):
         rec = {"first_seen": "2026-11-03 15:35:00", "verdict": "제외", "score": -2, "body": "공지", "user_label": "업무"}
-        self.assertEqual(row_values(rec), ("11-03 15:35", "제외 → 업무", -2, "공지"))
+        self.assertEqual(row_values(rec), ("11-03 15:35", "쪽지", "제외 → 업무", -2, "공지"))
+
+    def test_merged_records_sorted_and_tagged(self):
+        ezq = [{"msg_key": "m1", "first_seen": "2026-11-03 09:00:00", "verdict": "제외", "score": -2, "body": "쪽지"}]
+        doc = [{"msg_key": "d1", "first_seen": "2026-11-04 10:00:00", "verdict": "제외", "score": -1, "body": "문서"}]
+        recs = merged_records(ezq, doc)
+        self.assertEqual([r["msg_key"] for r in recs], ["d1", "m1"])
+        self.assertEqual([r["origin"] for r in recs], [ORIGIN_DOC, ORIGIN_EZQ])
+        self.assertEqual([r["row_id"] for r in recs], ["문서:d1", "쪽지:m1"])
+        self.assertEqual(row_values(recs[0])[1], "문서")
+
+    def test_rows_dispatch_by_origin(self):
+        ezq = [{"msg_key": "abc", "first_seen": "2026-11-03 09:00:00"}]
+        doc = [{"msg_key": "abc", "first_seen": "2026-11-03 09:00:00"}]
+        ids = {r["row_id"] for r in merged_records(ezq, doc)}
+        self.assertEqual(ids, {"쪽지:abc", "문서:abc"})
+
+    def test_view_names(self):
+        self.assertEqual(
+            [v[0] for v in VIEWS], ["제외된 쪽지·문서", "'업무 아님'으로 표시한 쪽지·문서", "전체 판정 기록"]
+        )
 
 
 
 class FakeCollector:
-    def __init__(self, owns):
+    def __init__(self, owns, doc=False):
         self.owns = owns
+        self.doc = doc
 
     def is_list_task(self, task):
         return self.owns
+
+    def is_doc_task(self, task):
+        return self.doc
 
 
 class TestReviewHandler(unittest.TestCase):
@@ -47,9 +81,27 @@ class TestReviewHandler(unittest.TestCase):
         ezq, wm = object(), FakeCollector(False)
         self.assertIs(review_handler(TaskItem(title="x"), ezq, wm), ezq)
 
+    def test_review_handler_doc_task(self):
+        ezq, wm = object(), FakeCollector(False, doc=True)
+        self.assertIs(review_handler(TaskItem(title="x", source=TaskSource.PORTAL), ezq, wm), wm)
+
     def test_without_workmgmt_collector(self):
         ezq = object()
         self.assertIs(review_handler(TaskItem(title="x"), ezq, None), ezq)
+
+
+class TestConfirmHandler(unittest.TestCase):
+    def test_list_task_goes_to_ezq_collector(self):
+        ezq, wm = object(), FakeCollector(True)
+        self.assertIs(confirm_handler(TaskItem(title="x"), ezq, wm), ezq)
+
+    def test_doc_only_task_goes_to_workmgmt_collector(self):
+        ezq, wm = object(), FakeCollector(False, doc=True)
+        self.assertIs(confirm_handler(TaskItem(title="x"), ezq, wm), wm)
+
+    def test_list_and_doc_task_goes_to_ezq_collector(self):
+        ezq, wm = object(), FakeCollector(True, doc=True)
+        self.assertIs(confirm_handler(TaskItem(title="x"), ezq, wm), ezq)
 
 
 if __name__ == "__main__":

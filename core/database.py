@@ -69,10 +69,30 @@ def add_months(src_date: date, months: int = 1) -> date:
     return date(year, month, day)
 
 
+def next_period(start: date, end: date, recurrence: str, today: date) -> Tuple[date, date]:
+    """반복 기간 업무의 다음 기간. 시작·끝을 한 주기씩 함께 밀고, 끝이 오늘 이후가 될 때까지 반복.
+
+    완료 시·만료 시 모두 같은 값이 나와야 같은 다음 기간을 두 번 만들지 않음.
+    월 반복은 기존 반복 업무처럼 직전 날짜에 add_months(·, 1) (말일 보정은 누적됨).
+    """
+    while True:
+        if recurrence == RecurrenceType.DAILY:
+            start, end = start + timedelta(days=1), end + timedelta(days=1)
+        elif recurrence == RecurrenceType.WEEKLY:
+            start, end = start + timedelta(days=7), end + timedelta(days=7)
+        elif recurrence == RecurrenceType.MONTHLY:
+            start, end = add_months(start, 1), add_months(end, 1)
+        else:
+            raise ValueError(f"반복 아님: {recurrence}")
+        if end >= today:
+            return start, end
+
+
 class DatabaseManager:
     def __init__(self, db_path: str = "todo_data.db"):
         self.db_path = db_path
         self._lock = threading.RLock()
+        self._next_task_created = True  # 마지막 set_task_status가 다음 업무를 새로 만들었는지
         self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
@@ -141,6 +161,9 @@ class DatabaseManager:
                         "UPDATE tasks SET ezq_key = substr(external_key, 5, instr(external_key, '|') - 5)"
                         " WHERE external_key LIKE 'EZQ:%|%'"
                     )
+                if "start_date" not in existing_cols:
+                    # 기간 업무의 시작일 (due_date는 기간의 끝). 빈 값이면 일반 마감 업무
+                    cur.execute("ALTER TABLE tasks ADD COLUMN start_date TEXT DEFAULT ''")
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_tasks_external_key ON tasks(external_key)"
                 )
@@ -197,6 +220,16 @@ class DatabaseManager:
                 wm_cols = {r["name"] for r in cur.execute("PRAGMA table_info(workmgmt_docs)").fetchall()}
                 if "task_id" not in wm_cols:
                     cur.execute("ALTER TABLE workmgmt_docs ADD COLUMN task_id INTEGER")
+                # 문서 본문 판정 기록 (EzQ 쪽지와 같은 점수표). 이전 기록은 body가 비어 목록에 안 나옴
+                for col, ddl in (
+                    ("verdict", "TEXT DEFAULT ''"),
+                    ("score", "INTEGER DEFAULT 0"),
+                    ("reasons", "TEXT DEFAULT ''"),
+                    ("body", "TEXT DEFAULT ''"),
+                    ("user_label", "TEXT DEFAULT ''"),
+                ):
+                    if col not in wm_cols:
+                        cur.execute(f"ALTER TABLE workmgmt_docs ADD COLUMN {col} {ddl}")
                 conn.commit()
             finally:
                 conn.close()
@@ -225,7 +258,17 @@ class DatabaseManager:
             due_estimated=bool(row["due_estimated"]),
             needs_review=bool(row["needs_review"]),
             ezq_key=row["ezq_key"] or "",
+            start_date=row["start_date"] or "",
         )
+
+    @staticmethod
+    def _normalized_start(task: TaskItem) -> str:
+        """시작일이 마감일과 같거나 늦으면 기간이 아니므로 빈 값으로 저장."""
+        start = (task.start_date or "").strip()
+        due = (task.due_date or "").strip()
+        if start and due and start >= due:
+            return ""
+        return start
 
     def task_exists_by_hash(self, content_hash: str) -> bool:
         if not content_hash:
@@ -262,8 +305,8 @@ class DatabaseManager:
                         due_date, due_time, status, label, priority,
                         recurrence, is_new_scan, notified_at, snooze_until,
                         created_at, updated_at, completed_at,
-                        external_key, due_estimated, needs_review, ezq_key
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        external_key, due_estimated, needs_review, ezq_key, start_date
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task.title.strip(),
@@ -287,6 +330,7 @@ class DatabaseManager:
                         1 if task.due_estimated else 0,
                         1 if task.needs_review else 0,
                         task.ezq_key,
+                        self._normalized_start(task),
                     ),
                 )
                 conn.commit()
@@ -421,8 +465,10 @@ class DatabaseManager:
             existing.due_estimated
             or existing.due_date != task.due_date
             or existing.due_time != task.due_time
+            or (task.start_date and existing.start_date != task.start_date)  # 기간 없는 재스캔은 갱신 사유가 아님
         ):
             existing.due_date, existing.due_time = task.due_date, task.due_time
+            existing.start_date = task.start_date  # 기간 공문이면 시작일도 (시작 > 끝 방지)
             existing.due_estimated = False
             existing.notified_at = None  # 바뀐 기한으로 다시 알림
             changed = True
@@ -473,7 +519,8 @@ class DatabaseManager:
                         external_key = ?,
                         due_estimated = ?,
                         needs_review = ?,
-                        ezq_key = ?
+                        ezq_key = ?,
+                        start_date = ?
                     WHERE id = ?
                     """,
                     (
@@ -496,6 +543,7 @@ class DatabaseManager:
                         1 if task.due_estimated else 0,
                         1 if task.needs_review else 0,
                         task.ezq_key,
+                        self._normalized_start(task),
                         task.id,
                     ),
                 )
@@ -512,10 +560,21 @@ class DatabaseManager:
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         was_completed = task.status == TaskStatus.COMPLETED
+        self._next_task_created = True
         task.status = new_status
         task.is_new_scan = False
         task.completed_at = now_str if new_status == TaskStatus.COMPLETED else None
         self.update_task(task)
+
+        if (
+            new_status == TaskStatus.COMPLETED
+            and not was_completed
+            and task.recurrence != RecurrenceType.NONE
+            and task.is_period
+        ):
+            # 반복 기간 업무: 같은 길이의 다음 기간 (만료 때 이미 만들었으면 그 업무 id, 지웠으면 None)
+            next_id, self._next_task_created = self._create_next_period(task, date.today())
+            return next_id
 
         next_task_id = None
         if (
@@ -561,6 +620,112 @@ class DatabaseManager:
                 pass
 
         return next_task_id
+
+    def next_task_was_created(self) -> bool:
+        """마지막 set_task_status가 돌려준 다음 업무를 그때 새로 만들었는지 (False = 만료 때 이미 만든 기간)."""
+        return self._next_task_created
+
+    def _get_setting(self, key: str) -> Optional[str]:
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+                return row["value"] if row else None
+            finally:
+                conn.close()
+
+    def _set_setting(self, key: str, value: str) -> None:
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)", (key, value)
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def _task_id_by_hash(self, content_hash: str) -> Optional[int]:
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                row = conn.execute(
+                    "SELECT id FROM tasks WHERE content_hash = ? ORDER BY id LIMIT 1", (content_hash,)
+                ).fetchone()
+                return row["id"] if row else None
+            finally:
+                conn.close()
+
+    def _create_next_period(self, task: TaskItem, today: date) -> Tuple[Optional[int], bool]:
+        """반복 기간 업무의 다음 기간 업무를 만들고 (id, 새로 만들었는지) 반환.
+
+        표시는 다음 기간 업무의 해시로 남김 → 어느 원본(사슬의 앞 업무)에서 오든 그 기간은 한 번만 생기고,
+        지운 뒤에도 다시 생기지 않음. 이미 있으면 그 업무 id, 지워졌으면 None.
+        """
+        try:
+            start = datetime.strptime(task.start_date, "%Y-%m-%d").date()
+            end = datetime.strptime(task.due_date, "%Y-%m-%d").date()
+            next_start, next_end = next_period(start, end, task.recurrence, today)
+        except ValueError:
+            return None, False
+        next_due_str = next_end.strftime("%Y-%m-%d")
+        next_hash = compute_content_hash(
+            task.title, f"{task.source_ref}|recur|{next_due_str}", task.description
+        )
+        marker = f"period_next:{next_hash}"
+        with self._lock:
+            if self._get_setting(marker) is not None:
+                return self._task_id_by_hash(next_hash), False
+            next_item = TaskItem(
+                title=task.title,
+                description=task.description,
+                source=task.source,
+                source_ref=task.source_ref,
+                content_hash=next_hash,
+                due_date=next_due_str,
+                due_time=task.due_time,
+                status=TaskStatus.PENDING,
+                label=task.label,
+                priority=task.priority,
+                recurrence=task.recurrence,
+                is_new_scan=False,
+                start_date=next_start.strftime("%Y-%m-%d"),  # 같은 날이면 add_task가 기한 업무로 저장
+            )
+            next_task_id, created = self.add_task(next_item, skip_if_duplicate=True)
+            self._set_setting(marker, "1")
+            if created:
+                return next_task_id, True
+            return self._task_id_by_hash(next_hash), False
+
+    def activate_expired_periods(self, today: Optional[date] = None) -> List[int]:
+        """끝날이 지난 미완료 반복 기간 업무마다 다음 기간 업무를 만들고 새 id 목록을 반환.
+
+        원본은 미완료로 남겨 기한경과·이월로 계속 보이게 함 (구글 캘린더 여러 날 일정처럼 다음 기간이 열림).
+        """
+        today = today or date.today()
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM tasks
+                    WHERE status != ? AND recurrence != ? AND start_date != ''
+                      AND needs_review = 0 AND due_date != '' AND due_date < ?
+                    ORDER BY id
+                    """,
+                    (TaskStatus.COMPLETED, RecurrenceType.NONE, today.strftime("%Y-%m-%d")),
+                ).fetchall()
+            finally:
+                conn.close()
+            created: List[int] = []
+            for row in rows:
+                task = self._row_to_task(row)
+                if not task.is_period:
+                    continue
+                new_id, is_new = self._create_next_period(task, today)
+                if is_new and new_id:
+                    created.append(new_id)
+            return created
 
     def delete_task(self, task_id: int) -> bool:
         with self._lock:
@@ -648,11 +813,16 @@ class DatabaseManager:
                 conn.close()
 
     def reschedule_task(self, task_id: int, new_due_date: str) -> Optional[TaskItem]:
-        """기한 날짜만 옮김 (끌어다 놓기·미루기). 시각은 유지하고, 이미 보낸 알림과 다시 알림은 초기화."""
-        datetime.strptime(new_due_date, "%Y-%m-%d")  # 형식이 틀리면 ValueError
+        """기한 날짜만 옮김 (끌어다 놓기·미루기). 시각은 유지하고, 이미 보낸 알림과 다시 알림은 초기화.
+        기간 업무는 시작일도 같은 날수만큼 옮겨 기간 길이를 유지."""
+        new_due = datetime.strptime(new_due_date, "%Y-%m-%d").date()  # 형식이 틀리면 ValueError
         task = self.get_task(task_id)
         if not task:
             return None
+        if task.is_period:
+            delta = new_due - datetime.strptime(task.due_date, "%Y-%m-%d").date()
+            start = datetime.strptime(task.start_date, "%Y-%m-%d").date() + delta
+            task.start_date = start.strftime("%Y-%m-%d")
         task.due_date = new_due_date
         task.due_estimated = False
         task.notified_at = None
@@ -732,8 +902,11 @@ class DatabaseManager:
         include_rollover_on_today: bool = True,
         year_month: Optional[str] = None,  # YYYY-MM
         needs_review: Optional[bool] = False,
+        include_period_span: bool = False,
     ) -> List[TaskItem]:
         """다중 조건 검색 및 미완료 업무 자동 이월(Rollover) 지원 조회.
+
+        include_period_span: True면 target_date가 시작~끝 사이인 기간 업무도 그날 업무로 (오른쪽 날짜 목록용).
 
         needs_review: 기본(False)은 '확인 필요' 업무를 빼서 캘린더·목록·브리핑·알림·통계에 나오지 않게 함.
         True면 확인 필요 업무만, None이면 모두.
@@ -772,15 +945,19 @@ class DatabaseManager:
             params.append(source_filter)
 
         if target_date:
+            day_sql, day_params = "due_date = ?", [target_date]
+            if include_period_span:
+                day_sql = "(due_date = ? OR (start_date != '' AND start_date <= ? AND due_date >= ?))"
+                day_params = [target_date, target_date, target_date]
             if include_rollover_on_today and target_date == today_str:
                 # 오늘 날짜 선택 시: 오늘 마감 업무 + 과거 기한 경과 미완료 업무(Rollover) 함께 표시
                 clauses.append(
-                    "(due_date = ? OR (status != ? AND due_date != '' AND due_date < ?))"
+                    f"({day_sql} OR (status != ? AND due_date != '' AND due_date < ?))"
                 )
-                params.extend([target_date, TaskStatus.COMPLETED, today_str])
+                params.extend(day_params + [TaskStatus.COMPLETED, today_str])
             else:
-                clauses.append("due_date = ?")
-                params.append(target_date)
+                clauses.append(day_sql)
+                params.extend(day_params)
 
         if year_month:
             clauses.append("due_date LIKE ?")
@@ -972,6 +1149,73 @@ class DatabaseManager:
             finally:
                 conn.close()
 
+    # ── 업무관리시스템 문서 판정 기록 (ezq_messages와 같은 모양) ──────────
+
+    @staticmethod
+    def _workmgmt_judgment_row(row: sqlite3.Row) -> dict:
+        d = dict(row)
+        d["msg_key"] = d["doc_key"]
+        d["reasons"] = [r for r in (d.get("reasons") or "").split("\n") if r]
+        return d
+
+    def record_workmgmt_judgment(
+        self, doc_key: str, verdict: str, score: int, reasons: List[str], body: str
+    ) -> None:
+        """문서 판정 결과를 기록. 행이 있으면 판정 열만 갱신(사용자 표시·처음 본 시각 보존), 없으면 새로 만듦."""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                conn.execute(
+                    "INSERT INTO workmgmt_docs (doc_key, first_seen, title, verdict, score, reasons, body)"
+                    " VALUES (?, ?, '', ?, ?, ?, ?)"
+                    " ON CONFLICT(doc_key) DO UPDATE SET verdict = excluded.verdict, score = excluded.score,"
+                    " reasons = excluded.reasons, body = excluded.body",
+                    (doc_key, now, verdict, score, "\n".join(reasons), body),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def set_workmgmt_user_label(self, doc_key: str, label: str) -> None:
+        """사용자 정답 표시 ('업무' / '업무아님' / '' 취소)."""
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                conn.execute("UPDATE workmgmt_docs SET user_label = ? WHERE doc_key = ?", (label, doc_key))
+                conn.commit()
+            finally:
+                conn.close()
+
+    def get_workmgmt_judgment(self, doc_key: str) -> Optional[dict]:
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                row = conn.execute("SELECT * FROM workmgmt_docs WHERE doc_key = ?", (doc_key,)).fetchone()
+                return self._workmgmt_judgment_row(row) if row else None
+            finally:
+                conn.close()
+
+    def list_workmgmt_judgments(
+        self, verdict: Optional[str] = None, user_label: Optional[str] = None, limit: int = 300
+    ) -> List[dict]:
+        """본문을 판정한 문서 기록 (최신순). 판정 도입 전 기록(본문 없음)과 배부 목록 기록은 제외."""
+        sql, args = "SELECT * FROM workmgmt_docs WHERE body != '' AND doc_key NOT LIKE 'LIST:%'", []
+        if verdict is not None:
+            sql += " AND verdict = ?"
+            args.append(verdict)
+        if user_label is not None:
+            sql += " AND user_label = ?"
+            args.append(user_label)
+        sql += " ORDER BY first_seen DESC LIMIT ?"
+        args.append(limit)
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                return [self._workmgmt_judgment_row(r) for r in conn.execute(sql, args).fetchall()]
+            finally:
+                conn.close()
+
     def find_workmgmt_doc_by_task(self, task_id: int, prefix: str = "LIST:") -> Optional[dict]:
         """그 업무를 가리키는 업무관리시스템 기록 (기본: 배부 목록 기록)."""
         with self._lock:
@@ -982,6 +1226,20 @@ class DatabaseManager:
                     (task_id, f"{prefix}%"),
                 ).fetchone()
                 return dict(row) if row else None
+            finally:
+                conn.close()
+
+    def find_workmgmt_judgment_by_task(self, task_id: int) -> Optional[dict]:
+        """그 업무를 가리키는 문서 판정 기록 (배부 목록·별칭 기록과 판정 없는 기록은 제외)."""
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                row = conn.execute(
+                    "SELECT * FROM workmgmt_docs WHERE task_id = ? AND doc_key NOT LIKE 'LIST:%'"
+                    " AND COALESCE(verdict, '') != '' ORDER BY first_seen LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                return self._workmgmt_judgment_row(row) if row else None
             finally:
                 conn.close()
 
@@ -1015,6 +1273,40 @@ class DatabaseManager:
             if ratio >= best_ratio:
                 best, best_ratio = row, ratio
         return dict(best) if best else None
+
+    def find_excluded_workmgmt_judgments(self, doc_no: str, title: str, threshold: float = 0.85) -> List[dict]:
+        """배부 목록 행과 같은 문서일 수 있는 '제외' 판정 문서 기록 (업무 없음, '업무아님' 표시 안 함, 최근 30일).
+
+        배부 목록보다 먼저 읽혀 제외된 배부 문서를 찾는 후보: 본문에 문서번호가 있는 기록 먼저, 다음은 제목 유사도
+        (find_workmgmt_list_doc과 같은 규칙). 같은 문서인지는 호출부가 본문을 다시 읽어 확인.
+        """
+        since = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM workmgmt_docs WHERE verdict = '제외' AND result = '제외' AND body != ''"
+                    " AND task_id IS NULL AND COALESCE(user_label, '') != ? AND doc_key NOT LIKE 'LIST:%' AND first_seen >= ?"
+                    " ORDER BY first_seen DESC",
+                    (self.EZQ_LABEL_NOT_TASK, since),
+                ).fetchall()
+            finally:
+                conn.close()
+        no = re.sub(r"\s+", "", doc_no or "")
+        target = _normalize_title(title)
+        by_no, by_title = [], []
+        for row in rows:
+            if no and no in re.sub(r"\s+", "", row["body"]):
+                by_no.append(row)
+                continue
+            cand = _normalize_title(row["title"])
+            if not target or not cand or re.findall(r"\d+", cand) != re.findall(r"\d+", target):
+                continue
+            ratio = difflib.SequenceMatcher(None, cand, target).ratio()
+            if ratio >= threshold:
+                by_title.append((ratio, row))
+        by_title.sort(key=lambda x: -x[0])
+        return [self._workmgmt_judgment_row(r) for r in by_no + [r for _ratio, r in by_title]]
 
     def find_topic_task(self, title: str, source: str, since: str) -> Optional[TaskItem]:
         """기한과 상관없이 주제어로 같은 일 찾기 (배부 목록 업무는 기한이 추정이라 find_similar_open_task로는 못 찾음).
@@ -1052,6 +1344,7 @@ class DatabaseManager:
             return False
         if official.id != keep.id:
             keep.due_date, keep.due_time, keep.due_estimated = official.due_date, official.due_time, official.due_estimated
+            keep.start_date = official.start_date
             keep.notified_at = None
             if official.external_key.startswith("DOC:") and not keep.external_key.startswith("DOC:"):
                 keep.external_key = official.external_key
@@ -1228,6 +1521,7 @@ class DatabaseManager:
         task.is_new_scan = True
         if new_due and task.due_estimated:
             task.due_date, task.due_time = new_due
+            task.start_date = ""  # 추정 기한 다시 잡기: 기간이 아니라 마감일
             task.notified_at = None
         self.update_task(task)
         return task

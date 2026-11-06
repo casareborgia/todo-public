@@ -64,6 +64,16 @@ class TestPreviewTasks(unittest.TestCase):
         self.assertEqual(preview_tasks([self.task(due_date="")], date(2026, 11, 1), date(2026, 11, 30), TODAY), {})
 
 
+    def test_preview_period_shifts_start(self):
+        t = self.task(start_date="2026-11-02", due_date="2026-11-06")
+        got = preview_tasks([t], date(2026, 11, 1), date(2026, 11, 30), TODAY)
+        p = got["2026-11-13"][0]
+        self.assertEqual((p.start_date, p.due_date), ("2026-11-09", "2026-11-13"))
+        self.assertTrue(p.is_period)
+        plain = preview_tasks([self.task()], date(2026, 11, 1), date(2026, 11, 30), TODAY)
+        self.assertEqual(plain["2026-11-13"][0].start_date, "")
+
+
 class TestLabelForRecurrence(unittest.TestCase):
     def test_default_label_becomes_routine(self):
         self.assertEqual(label_for_recurrence("MANUAL", RecurrenceType.WEEKLY), "ROUTINE")

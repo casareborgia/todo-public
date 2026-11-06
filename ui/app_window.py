@@ -1,7 +1,7 @@
 """메인 데스크톱 윈도우 (월간 캘린더 뷰 & 일정 목록 Agenda 뷰, 검색/필터, 상세 패널)."""
 
 import calendar
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import os
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -20,7 +20,7 @@ from parsers.import_check import check_files
 from parsers.quick_entry import parse_quick_entry
 from parsers.rule_parser import RuleBasedExtractor
 from ui.briefing_popup import DeadlineReminderPopup, StartupBriefingPopup
-from core.recurrence import preview_tasks
+from core.recurrence import drag_due_date, next_task_message, preview_tasks, span_dates
 from ui.ezq_log_dialog import EzqLogDialog, EzqReviewDialog, review_handler
 from ui.folder_dialogs import FolderSettingsDialog, ImportResultDialog
 from ui.calendar_fit import chips_that_fit, fit_title
@@ -119,6 +119,7 @@ class TodoCalendarApp(tk.Tk):
         self._ctx_menu: Optional[tk.Menu] = None
         self._quick_flash_job: Optional[str] = None
         self._quick_extractor: Optional[RuleBasedExtractor] = None
+        self._period_check_day: Optional[date] = None  # 반복 기간 만료 확인을 마지막으로 한 날 (하루 한 번)
 
         app_title = self.config_data.get("app_name", "사내 업무 캘린더 & 투두 매니저")
         self.title(f"{app_title} v{self.config_data.get('version', '1.4.0')}")
@@ -136,6 +137,8 @@ class TodoCalendarApp(tk.Tk):
             initial_new += self.ezq_collector.collect_and_register()
         if self.workmgmt_collector:
             initial_new += self.workmgmt_collector.collect_and_register()
+        # 끝날이 지난 반복 기간 업무의 다음 기간을 먼저 만들어 첫 화면에 보이게 함
+        self._activate_expired_periods()
         self.refresh_all()
 
         # 백그라운드 스케줄러 시작 (주기적 폴더 감시 & 기한 도래 알림)
@@ -307,7 +310,7 @@ class TodoCalendarApp(tk.Tk):
                 folder_row, text="", command=self.open_ezq_review_dialog, **{**small_btn, "bg": "#7C3AED"}
             )
             self._review_btn_anchor = tk.Button(
-                folder_row, text="🧾 제외된 쪽지", command=self.open_ezq_log_dialog, **small_btn
+                folder_row, text="🧾 제외된 쪽지·문서", command=self.open_ezq_log_dialog, **small_btn
             )
             self._review_btn_anchor.pack(side=tk.LEFT, padx=(6, 0))
         # '업무 아님' 직후 잠깐 보이는 되돌리기 버튼
@@ -1058,17 +1061,27 @@ class TodoCalendarApp(tk.Tk):
         overdue_tasks: List[TaskItem] = []
         today_str = date.today().strftime("%Y-%m-%d")
 
+        flat_dates = [d for week in month_days[:6] for d in week]
+        first_day, last_day = flat_dates[0], flat_dates[-1]
+        # 기간 업무는 보이는 모든 날 칸에 (달이 바뀌는 기간도 겹치는 칸에 모두)
         for t in all_tasks:
             if not t.due_date:
                 continue
-            tasks_by_date.setdefault(t.due_date, []).append(t)
+            for d in span_dates(t, first_day, last_day):
+                tasks_by_date.setdefault(d.strftime("%Y-%m-%d"), []).append(t)
             if t.is_overdue():
                 overdue_tasks.append(t)
 
-        flat_dates = [d for week in month_days[:6] for d in week]
         self._cell_dates = {}
-        # 반복 업무의 앞으로의 날짜 (저장하지 않는 미리보기, 진짜 업무 다음에 흐리게)
-        previews = preview_tasks(all_tasks, flat_dates[0], flat_dates[-1], date.today())
+        # 반복 업무의 앞으로의 날짜 (저장하지 않는 미리보기, 진짜 업무 다음에 흐리게).
+        # 끝이 달력 뒤라도 시작이 달력 안이면 보이게, 가장 긴 기간만큼 더 넓게 구함
+        longest = max((len(span_dates(t, date.min, date.max)) - 1 for t in all_tasks if t.is_period), default=0)
+        preview_by_due = preview_tasks(all_tasks, first_day, last_day + timedelta(days=longest), date.today())
+        previews: Dict[str, List[TaskItem]] = {}
+        for items in preview_by_due.values():
+            for p in items:
+                for d in span_dates(p, first_day, last_day):
+                    previews.setdefault(d.strftime("%Y-%m-%d"), []).append(p)
 
         for idx, cell in enumerate(self.day_cells):
             for child in cell.winfo_children():
@@ -1150,8 +1163,10 @@ class TodoCalendarApp(tk.Tk):
             max_chips, hidden = chips_that_fit(len(day_items), avail_h, m["slot"], m["more"])
             text_w = cell.winfo_width() - 2 * (hl + 4) - 2 * 3 if cell.winfo_width() > 1 else 0
             for t in day_items[:max_chips]:
+                # 기간 업무의 이어지는 칸 (시작 칸과 각 주 첫 칸은 제목 그대로)
+                cont = t.is_period and d_str != t.start_date and col_idx != 0
                 if t.is_preview:
-                    self._add_preview_chip(cell, t, d_str, text_w, m)
+                    self._add_preview_chip(cell, t, d_str, text_w, m, cont)
                     continue
                 lbl_cfg = self.labels_config.get(t.label, {})
                 chip_bg = "#E2E8F0" if t.is_completed else lbl_cfg.get("bg_color", "#E0F2FE")
@@ -1161,6 +1176,8 @@ class TodoCalendarApp(tk.Tk):
                     chip_fg = "#B91C1C"
 
                 prefix = "✓ " if t.is_completed else ("🚨 " if t.is_overdue() else "• ")
+                if cont:
+                    prefix = "▸ "
                 if text_w > 0:
                     chip_text = fit_title(f"{prefix}{t.title}", text_w, m["chip_font"].measure)
                 else:
@@ -1206,11 +1223,13 @@ class TodoCalendarApp(tk.Tk):
                 more_lbl.bind("<Button-1>", lambda _e, ds=d_str: self._select_date(ds))
                 more_lbl.bind("<Button-3>", lambda e, ds=d_str: self._on_date_right_click(e, ds))
 
-    def _add_preview_chip(self, cell: tk.Frame, t: TaskItem, d_str: str, text_w: int, m: dict) -> None:
+    def _add_preview_chip(
+        self, cell: tk.Frame, t: TaskItem, d_str: str, text_w: int, m: dict, cont: bool = False
+    ) -> None:
         """반복 업무의 다음 날짜 미리보기 칸: 라벨 바탕색에 흐린 글자, 끌어 옮기기·업무 메뉴 없음.
-        두 번 누르면 반복 업무(지금 진행할 회차)를 엶."""
+        두 번 누르면 반복 업무(지금 진행할 회차)를 엶. cont: 기간 미리보기의 이어지는 칸."""
         lbl_cfg = self.labels_config.get(t.label, {})
-        text = f"↻ {t.title}"
+        text = f"▸ {t.title}" if cont else f"↻ {t.title}"
         chip_text = fit_title(text, text_w, m["chip_font"].measure) if text_w > 0 else (
             text if len(text) <= 15 else text[:14] + "…"
         )
@@ -1299,7 +1318,7 @@ class TodoCalendarApp(tk.Tk):
                 iid=iid,
                 values=(
                     t.d_day_badge(),
-                    f"{t.due_date} {t.due_time}",
+                    f"{t.period_label() if t.is_period else t.due_date} {t.due_time}",
                     lbl_name,
                     t.title,
                     src_str,
@@ -1339,6 +1358,7 @@ class TodoCalendarApp(tk.Tk):
         tasks = self.db.query_tasks(
             target_date=self.selected_date_str,
             include_rollover_on_today=True,
+            include_period_span=True,
             **f_args,
         )
 
@@ -1348,6 +1368,8 @@ class TodoCalendarApp(tk.Tk):
             lbl_name = self.labels_config.get(t.label, {}).get("name", t.label)
             st_str = TaskStatus.ALL_LABELS.get(t.status, t.status)
             time_or_dday = f"🚨이월({t.due_date[5:]})" if t.is_overdue() else f"{t.due_time} ({t.d_day_badge()})"
+            if t.is_period and not t.is_overdue():
+                time_or_dday = f"{t.period_label()} ({t.d_day_badge()})"
 
             if t.is_completed:
                 tag = "completed"
@@ -1393,9 +1415,14 @@ class TodoCalendarApp(tk.Tk):
         lbl_name = self.labels_config.get(task.label, {}).get("name", task.label)
         recur_name = RecurrenceType.ALL_LABELS.get(task.recurrence, "반복 없음")
         st_name = TaskStatus.ALL_LABELS.get(task.status, task.status)
+        due_line = (
+            f"• 기간: {task.start_date} ~ {task.due_date} {task.due_time} ({task.d_day_badge()})"
+            if task.is_period
+            else f"• 마감기한: {task.due_date} {task.due_time} ({task.d_day_badge()})"
+        )
         meta_text = (
             f"• 제목: {task.title}\n"
-            f"• 마감기한: {task.due_date} {task.due_time} ({task.d_day_badge()})  |  상태: {st_name}\n"
+            f"{due_line}  |  상태: {st_name}\n"
             f"• 분류라벨: {lbl_name}  |  반복: {recur_name}\n"
             f"• 출처/문서번호: {task.source_ref or TaskSource.ALL_LABELS.get(task.source, task.source)}"
         )
@@ -1427,7 +1454,9 @@ class TodoCalendarApp(tk.Tk):
         )
         self.detail_text.config(state=tk.NORMAL)
         self.detail_text.delete("1.0", tk.END)
-        self.detail_text.insert("1.0", "\n".join(f"• {t.due_date} {t.due_time}  {t.title}" for t in tasks))
+        self.detail_text.insert("1.0", "\n".join(
+            f"• {t.period_label() if t.is_period else t.due_date} {t.due_time}  {t.title}" for t in tasks
+        ))
         self.detail_text.config(state=tk.DISABLED)
 
     def _tree_selection(self, tree: ttk.Treeview, task_map: Dict[str, TaskItem]) -> tuple:
@@ -1515,14 +1544,15 @@ class TodoCalendarApp(tk.Tk):
             else TaskStatus.COMPLETED
         )
         next_recur_id = self.db.set_task_status(self.selected_task.id, new_st)
+        next_created = self.db.next_task_was_created()
         self.selected_task = self.db.get_task(self.selected_task.id)
         self.refresh_all()
         if next_recur_id is not None:
             next_task = self.db.get_task(next_recur_id)
             if next_task:
                 messagebox.showinfo(
-                    "반복 일정 자동 생성",
-                    f"정기/반복 업무가 완료되어 다음 주기 일정이 자동 등록되었습니다.\n• 다음 마감일: {next_task.due_date}",
+                    "반복 일정 자동 생성" if next_created else "반복 일정",
+                    next_task_message(next_task, next_created),
                     parent=self,
                 )
 
@@ -1577,7 +1607,9 @@ class TodoCalendarApp(tk.Tk):
         EzqReviewDialog(self, self.ezq_collector, on_changed=self.refresh_all, workmgmt_collector=self.workmgmt_collector)
 
     def open_ezq_log_dialog(self) -> None:
-        EzqLogDialog(self, self.ezq_collector, on_registered=self._on_bg_new_tasks_found)
+        EzqLogDialog(
+            self, self.ezq_collector, on_registered=self._on_bg_new_tasks_found, workmgmt_collector=self.workmgmt_collector
+        )
 
     def _current_tree(self) -> tuple:
         """삭제할 목록과 그 표. 목록 보기에서 일정 목록을 마지막으로 썼으면 그것, 아니면 오른쪽 날짜 목록."""
@@ -1638,7 +1670,8 @@ class TodoCalendarApp(tk.Tk):
                 items.append((text, lambda nd=new_date: self._reschedule_task(task, nd)))
         items.append(None)
         if (self.ezq_collector and ezq_key_of(task)) or (
-            self.workmgmt_collector and self.workmgmt_collector.is_list_task(task)
+            self.workmgmt_collector
+            and (self.workmgmt_collector.is_list_task(task) or self.workmgmt_collector.is_doc_task(task))
         ):
             items.append(("🚫 업무 아님 (다시 등록 안 함)", lambda: self.dismiss_task(task)))
         items += [
@@ -1759,7 +1792,8 @@ class TodoCalendarApp(tk.Tk):
         self._highlight_drop_cell(None)
         new_date = self._cell_dates.get(str(target)) if target is not None else None
         if new_date and new_date != d["from"]:
-            self._reschedule_task(d["task"], new_date)
+            # 기간 업무는 가운데 칸에서 끌어도 옮긴 날수만큼 시작·끝을 함께 옮김
+            self._reschedule_task(d["task"], drag_due_date(d["task"], d["from"], new_date))
         elif self._refresh_pending:
             self.refresh_all()
 
@@ -1964,7 +1998,18 @@ class TodoCalendarApp(tk.Tk):
         created = self.folder_collector.collect_and_register(force=False)
         if created:
             self.after(0, self._on_bg_new_tasks_found, created)
+        # 날짜가 바뀌면 (켜 둔 채 자정을 넘김) 끝난 반복 기간의 다음 기간을 만듦
+        if self._period_check_day != date.today() and self._activate_expired_periods():
+            self.after(0, self.refresh_all)
         return len(created)
+
+    def _activate_expired_periods(self) -> List[int]:
+        """끝날이 지난 반복 기간 업무의 다음 기간 활성화 (하루 한 번). 실패해도 앱은 계속."""
+        self._period_check_day = date.today()
+        try:
+            return self.db.activate_expired_periods()
+        except Exception:  # noqa: BLE001  백그라운드 확인 실패로 앱이 멈추면 안 됨
+            return []
 
     def _bg_fast_tick(self) -> int:
         """몇 초마다: EzQ 쪽지 창과 업무관리시스템 문서 창 확인."""

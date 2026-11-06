@@ -62,7 +62,52 @@ def is_cited_doc_no(text: str, start: int, end: int) -> bool:
 NON_DEADLINE_LINE_RE = re.compile(
     r"(작성일|발신일|수신일|시행일|등록일|접수일|기안일|결재일|생산일|배부일|발송일)"
     r"|^\s*(?:\d+\.\s*)?(?:관련|시행|접수)(?:\s|[:：])"
+    # 공문 결재란 '전결 10/21' (결재한 날짜)
+    r"|^\s*전결(?:\s|$)"
 )
+
+# 마감일 후보에서 뺄 것 (실제 공문 표본 2026-11-06)
+# - 인용한 문서번호 바로 뒤 (날짜): '가상부-123(2026.08.27.)'는 그 문서의 날짜
+# - 날짜만 있는 줄: 공문(시행 줄이 있는 문서)의 PDF 인쇄 표시 '10/21'.
+#   바로 앞 줄에 기한 낱말이 있으면('회신기한' 다음 줄 '11/20') 기한 값이라 그대로 둠
+CITED_DOC_DATE_RE = re.compile(
+    r"[가-힣A-Za-z]+-\d+\s*\(\s*(?:20\d{2}|['‘’`]\d{2})\s*[.\-/년]\s*\d{1,2}\s*[.\-/월]\s*\d{1,2}\s*일?\s*\.?\s*\)"
+)
+DATE_ONLY_LINE_RE = re.compile(r"\d{1,2}\s*[/.]\s*\d{1,2}\s*\.?")
+# 마감 키워드 줄로 볼 낱말. '限'은 공문에서 '까지'의 뜻 (예: '명단 송부(11.2(월) 限)')
+DEADLINE_LINE_KEYWORDS = ("기한", "마감", "까지", "限", "회신", "제출", "완료일", "처리기한", "기일", "목표일")
+# 공문 하단 '시행 가상부-456 ( 2026.10.21. )': 이 문서의 시행일. 기한은 시행일보다 앞설 수 없음 (같은 날은 됨)
+ENFORCE_DATE_RE = re.compile(
+    r"^\s*시행\s*" + DOC_NO_TOKEN + r"\s*\(\s*(20\d{2})\s*[.\-/]\s*(\d{1,2})\s*[.\-/]\s*(\d{1,2})",
+    re.MULTILINE,
+)
+
+# 기간 표현 (예: '11/10 ~ 11/14', '11.10.-11.14.', '2026.11.10 ~ 2026.11.20', '11/10~14')
+# 날짜: 연도(2026·'26)는 있어도 없어도 됨. 연도가 있을 때만 '2026-11-10'처럼 '-'로 이은 날짜를 인정
+def _period_date(p: str) -> str:
+    return (
+        r"(?:(?P<" + p + r"y>20\d{2}|['‘’`]\d{2})\s*[.\-/년]\s*)?"
+        r"(?P<" + p + r"m>\d{1,2})\s*(?:[./월]|(?(" + p + r"y)-|(?!)))\s*(?P<" + p + r"d>\d{1,2})(?!\d)\s*일?\s*\.?"
+    )
+
+
+_PERIOD_WD = r"(?:\s*\(\s*[월화수목금토일]\s*\))?"
+# 끝이 일만인 기간의 끝 일 뒤에 올 수 있는 것 (message_scorer의 기간 대안도 같은 경계를 씀)
+PERIOD_DAY_END_TAIL = (
+    r"(?:\s*일)?\.?(?:\s*\(\s*[월화수목금토일]\s*\))?(?=$|\s|[,)\]]|까지|부터|이내|내)"
+    # 띄어 쓴 단위도 수량·시각 범위 ('3~4 명', '~3 쪽'). 단위 글자로 시작하는 낱말('회신', '시행', '주시기')은 그대로 둠
+    r"(?!\s*(?:[명개시분쪽번배건회차호주년월%](?![가-힣])|[명개쪽번배호][이을를은는씩]))"
+)
+PERIOD_RE = re.compile(
+    r"(?<![\d.])" + _period_date("s") + _PERIOD_WD + r"\s*(?P<sep>[~∼〜\-])\s*"
+    + r"(?:" + _period_date("e") + _PERIOD_WD
+    # 끝이 일만 ('11/10~14', '11/28~3'): 끝 일 뒤에 빈칸·글 끝·',)]'·'까지/부터/이내/내'가 올 때만 기간
+    # ('3~4명', '~3쪽', '1.5~2배', '14~16시'처럼 단위가 붙으면 수량·시각 범위)
+    + r"|(?P<dd>\d{1,2})" + PERIOD_DAY_END_TAIL + r")"
+)
+
+# 기한을 따로 적었다는 표시 (끝이 일만인 기간 A-3을 양보할지 판단)
+DEADLINE_WORD_RE = re.compile(r"까지|마감|기한|限")
 
 # 같은 줄에 본문이 이어지는 발신자 표기 (예: '[김철수 팀장] 감사 자료 보고 바랍니다')
 INLINE_CHAT_SENDER_RE = re.compile(r"^\s*\[[가-힣]{2,4}\s*" + JOB_TITLES + r"\]")
@@ -221,32 +266,117 @@ class RuleBasedExtractor(BaseTaskExtractor):
         기한 표현이 없으면 기본 N영업일 후로 추정하고 추정 여부를 True로 반환합니다.
         """
         today = ref_date or date.today()
-
-        deadline_lines = []
-        other_lines = []
-        for line in text.splitlines():
-            line_s = line.strip()
-            if not line_s or NON_DEADLINE_LINE_RE.search(line_s):
-                continue
-            if any(
-                k in line_s
-                # '限'은 공문에서 '까지'의 뜻 (예: '명단 송부(11.2(월) 限)')
-                for k in ("기한", "마감", "까지", "限", "회신", "제출", "완료일", "처리기한", "기일", "목표일")
-            ):
-                deadline_lines.append(line_s)
-            else:
-                other_lines.append(line_s)
+        deadline_lines, other_lines = self._split_deadline_lines(text)
+        floor = self._enforce_date(text)
 
         for target_chunk in ["\n".join(deadline_lines), "\n".join(other_lines)]:
             if not target_chunk:
                 continue
-            parsed_date = self._parse_date_from_chunk(target_chunk, today)
+            parsed_date = self._parse_date_from_chunk(target_chunk, today, floor)
             if parsed_date:
                 return parsed_date.strftime("%Y-%m-%d"), self._extract_time(target_chunk), False
 
         # 기한이 명시되지 않은 업무 지시문인 경우 기본 N영업일 후로 설정 (주말·공휴일 제외)
         fallback_date = self._add_business_days(today, self.default_days)
         return fallback_date.strftime("%Y-%m-%d"), self._extract_time("\n".join(deadline_lines + other_lines)), True
+
+    def _enforce_date(self, text: str) -> Optional[date]:
+        """공문 하단 '시행 부서-번호 ( YYYY.MM.DD. )'의 시행일. 없으면 None."""
+        m = ENFORCE_DATE_RE.search(text)
+        return self._safe_date(int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+    @staticmethod
+    def _split_deadline_lines(text: str) -> Tuple[List[str], List[str]]:
+        """(마감 키워드 줄, 나머지 줄). 작성·접수·시행일 줄과 '관련' 인용 줄은 둘 다에서 뺌.
+
+        인용 문서번호 뒤의 (날짜)는 지우고, 공문의 날짜만 있는 줄(인쇄 표시)은 뺌.
+        """
+        deadline_lines = []
+        other_lines = []
+        is_document = bool(ENFORCE_DATE_RE.search(text))
+        prev = ""
+        for line in text.splitlines():
+            line_s = line.strip()
+            prev_line, prev = prev, (line_s or prev)
+            if not line_s or NON_DEADLINE_LINE_RE.search(line_s):
+                continue
+            line_s = CITED_DOC_DATE_RE.sub(" ", line_s).strip()
+            if not line_s:
+                continue
+            if (DATE_ONLY_LINE_RE.fullmatch(line_s) and is_document
+                    and not any(k in prev_line for k in DEADLINE_LINE_KEYWORDS)):
+                continue
+            if any(k in line_s for k in DEADLINE_LINE_KEYWORDS):
+                deadline_lines.append(line_s)
+            else:
+                other_lines.append(line_s)
+        return deadline_lines, other_lines
+
+    @staticmethod
+    def _on_deadline_line(chunk: str, pos: int) -> bool:
+        """chunk의 pos가 든 줄이 마감 키워드 줄인지."""
+        start = chunk.rfind("\n", 0, pos) + 1
+        end = chunk.find("\n", pos)
+        line = chunk[start:] if end < 0 else chunk[start:end]
+        return any(k in line for k in DEADLINE_LINE_KEYWORDS)
+
+    def extract_period(self, text: str, ref_date: Optional[date] = None) -> Optional[Tuple[date, date]]:
+        """기간 표현 '시작 ~ 끝'의 (시작일, 끝일). 없으면 None.
+
+        줄 고르기는 extract_due와 같음: 마감 키워드 줄 우선, 그 안에서는 마지막 기간.
+        시행·접수일 줄은 빼서 문서 이력 날짜를 기간으로 읽지 않음.
+        """
+        today = ref_date or date.today()
+        floor = self._enforce_date(text)
+        for lines in self._split_deadline_lines(text):
+            found = None
+            for m in PERIOD_RE.finditer("\n".join(lines)):
+                period = self._resolve_period(m, today)
+                # 끝 날짜가 시행일보다 앞선 기간은 지난 일
+                if period and not (floor and period[1] < floor):
+                    found = period
+            if found:
+                return found
+        return None
+
+    def _resolve_period(self, m: "re.Match", today: date) -> Optional[Tuple[date, date]]:
+        """PERIOD_RE 매치 → (시작일, 끝일). 끝이 시작보다 앞이면 다음 해(끝이 일만이면 다음 달)로 넘김."""
+        def year(g: Optional[str]) -> Optional[int]:
+            if not g:
+                return None
+            return int(g) if g[0].isdigit() else 2000 + int(g[1:])
+
+        sy, sm, sd = year(m.group("sy")), int(m.group("sm")), int(m.group("sd"))
+        if m.group("dd"):
+            # 끝이 일만: '-'는 문서번호 오인을 막으려고 앞뒤 모두 월·일 날짜일 때만 인정
+            if m.group("sep") == "-":
+                return None
+            start = self._safe_date(sy, sm, sd) if sy else self._resolve_month_day(today, sm, sd)
+            if not start:
+                return None
+            ed = int(m.group("dd"))
+            y, mo = start.year, start.month
+            if ed < start.day:
+                y, mo = (y + 1, 1) if mo == 12 else (y, mo + 1)
+            end = self._safe_date(y, mo, ed)
+        else:
+            ey, em, ed = year(m.group("ey")), int(m.group("em")), int(m.group("ed"))
+            if sy and ey:
+                start, end = self._safe_date(sy, sm, sd), self._safe_date(ey, em, ed)
+            elif sy:
+                start = self._safe_date(sy, sm, sd)
+                end = start and self._safe_date(start.year, em, ed)
+                if start and end and end < start:
+                    end = self._safe_date(start.year + 1, em, ed)
+            else:
+                # 끝 날짜를 extract_due와 같은 방법으로 정한 뒤 시작을 그 앞에 둠 ('12/28~1/3' → 2026-12-28 ~ 2027-01-03)
+                end = self._safe_date(ey, em, ed) if ey else self._resolve_month_day(today, em, ed)
+                start = end and self._safe_date(end.year, sm, sd)
+                if start and end and start > end:
+                    start = self._safe_date(end.year - 1, sm, sd)
+        if not start or not end or end <= start:
+            return None
+        return start, end
 
     def _add_business_days(self, start: date, days: int) -> date:
         current = start
@@ -257,52 +387,75 @@ class RuleBasedExtractor(BaseTaskExtractor):
                 added += 1
         return current
 
-    def _parse_date_from_chunk(self, chunk: str, today: date) -> Optional[date]:
-        # A. 범위 표현 (~ 2026.11.15 또는 ~ 11/15 까지)에서 뒷날짜(마감일) 우선 추출
-        range_ymd = re.search(
-            r"[~\-∼]\s*(20\d{2})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})",
-            chunk,
-        )
-        if range_ymd:
-            d = self._safe_date(int(range_ymd.group(1)), int(range_ymd.group(2)), int(range_ymd.group(3)))
-            if d:
-                return d
+    def _parse_date_from_chunk(self, chunk: str, today: date, floor: Optional[date] = None) -> Optional[date]:
+        """floor: 공문 시행일. 시행일보다 앞선 날짜는 기한 후보에서 뺌 (인용한 지난 문서·행사 날짜)."""
+        def past(d: Optional[date]) -> bool:
+            return bool(floor and d and d < floor)
 
-        range_md = re.search(
-            r"[~\-∼]\s*(\d{1,2})\s*[./월]\s*(\d{1,2})\s*(?:일)?",
-            chunk,
-        )
-        if range_md:
-            d = self._resolve_month_day(today, int(range_md.group(1)), int(range_md.group(2)))
-            if d:
-                return d
-
-        # B. 'YYYY-MM-DD / YYYY.MM.DD / YYYY년 MM월 DD일', 공문식 줄임 연도 ''26.11.4' + '까지/마감/기한'
-        full_date_matches = list(
-            re.finditer(
-                r"(20\d{2}|['‘’`]\d{2})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})\s*(?:일)?",
-                chunk,
-            )
-        )
-        if full_date_matches:
-            # 여러 날짜가 있으면 가장 마지막(마감일일 확률이 높음) 날짜 선택
-            m = full_date_matches[-1]
+        def ymd(m: "re.Match") -> Optional[date]:
             year = m.group(1)
             year = 2000 + int(year[1:]) if not year[0].isdigit() else int(year)
-            d = self._safe_date(year, int(m.group(2)), int(m.group(3)))
+            return self._safe_date(year, int(m.group(2)), int(m.group(3)))
+
+        def md(m: "re.Match") -> Optional[date]:
+            return self._resolve_month_day(today, int(m.group(1)), int(m.group(2)))
+
+        # A. 범위 표현 (~ 2026.11.15 또는 ~ 11/15 까지)에서 뒷날짜(마감일) 우선 추출
+        range_ymd = next((m for m in re.finditer(
+            r"[~\-∼]\s*(20\d{2})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})",
+            chunk,
+        ) if not past(ymd(m))), None)
+        if range_ymd:
+            d = ymd(range_ymd)
+            if d:
+                return d
+
+        range_md = next((m for m in re.finditer(
+            r"[~\-∼]\s*(\d{1,2})\s*[./월]\s*(\d{1,2})\s*(?:일)?",
+            chunk,
+        ) if not past(md(m))), None)
+        if range_md:
+            d = md(range_md)
+            if d:
+                return d
+
+        # A-3. 끝이 일만 있는 기간 ('11/10~14', '11/28~3' → 12/3): 끝 날짜(마감일)
+        #      기간 밖에 '까지/마감/기한/限'이 있으면 따로 적힌 기한('2026.11.7까지', '내일까지')이 있는 것이므로
+        #      A-3을 쓰지 않고 아래 규칙에 맡김. 기간 바로 뒤의 '~14까지'는 기간의 끝이라 A-3 그대로
+        periods = list(PERIOD_RE.finditer(chunk))
+        day_end = [p for p in (self._resolve_period(m, today) for m in periods if m.group("dd")) if p and not past(p[1])]
+        spans = [(m.start(), re.compile(r"\s*").match(chunk, m.end()).end()) for m in periods]
+        explicit = any(
+            not any(a <= k.start() <= b for a, b in spans)
+            for k in DEADLINE_WORD_RE.finditer(chunk)
+        )
+        if day_end and not explicit:
+            return day_end[-1][1]
+
+        # B. 'YYYY-MM-DD / YYYY.MM.DD / YYYY년 MM월 DD일', 공문식 줄임 연도 ''26.11.4' + '까지/마감/기한'
+        full_date_matches = [
+            m for m in re.finditer(
+                r"(20\d{2}|['‘’`]\d{2})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})\s*(?:일)?",
+                chunk,
+            ) if not past(ymd(m))
+        ]
+        if full_date_matches:
+            # 여러 날짜가 있으면 가장 마지막(마감일일 확률이 높음) 날짜 선택
+            d = ymd(full_date_matches[-1])
             if d:
                 return d
 
         # C. 'MM월 DD일' 또는 'MM/DD', 'MM.DD' (단, 버전 번호나 문서 호수 오인 방지)
-        md_matches = list(
-            re.finditer(
-                r"(?<![0-9.])(\d{1,2})\s*(?:월|[/.])\s*(\d{1,2})\s*(?:일)?(?:\s*\([월화수목금토일]\))?(?=\s*(?:까지|마감|한|내|오전|오후|\d{1,2}시|\d{1,2}:\d{2}|\([월화수목금토일]\)|$|[,\s]))",
+        # 일 뒤의 '.'은 (요일)·까지·마감 앞, 또는 마감 키워드 줄의 줄 끝에서만 허용 ('11.17.(화)', '11.7.까지', '신청기한 : 11.17.').
+        # '11.10. 3~4명'은 그대로, '증가율 3.5.'·'버전 2.1.'처럼 키워드 없는 줄 끝 소수는 날짜로 읽지 않음
+        md_matches = [
+            m for m in re.finditer(
+                r"(?<![0-9.])(\d{1,2})\s*(?:월|[/.])\s*(\d{1,2})\s*(?:일)?(?:\.(?=\s*(?:\([월화수목금토일]\)|까지|마감))|(?P<eol>\.)(?=[ \t]*(?:\n|$)))?(?:\s*\([월화수목금토일]\))?(?=\s*(?:까지|마감|한|내|오전|오후|\d{1,2}시|\d{1,2}:\d{2}|\([월화수목금토일]\)|$|[,\s]))",
                 chunk,
-            )
-        )
+            ) if not past(md(m)) and (not m.group("eol") or self._on_deadline_line(chunk, m.start()))
+        ]
         if md_matches:
-            m = md_matches[-1]
-            d = self._resolve_month_day(today, int(m.group(1)), int(m.group(2)))
+            d = md(md_matches[-1])
             if d:
                 return d
 
@@ -596,6 +749,12 @@ class RuleBasedExtractor(BaseTaskExtractor):
             meta["sender"] = header.group(1).strip()
         title = self.extract_title(body)
         due_date, due_time, due_estimated = self.extract_due(body, ref_date=ref_date)
+        # 기간 표현이면 시작일도 남김. 끝 날짜가 고른 기한과 다르면(다른 줄의 기간 등) 시작일은 버림
+        start_date = ""
+        if not due_estimated:
+            period = self.extract_period(body, ref_date=ref_date)
+            if period and period[1].isoformat() == due_date:
+                start_date = period[0].isoformat()
         priority, label = self.detect_priority_and_label(body, source)
         recurrence = self.detect_recurrence(body)
 
@@ -625,6 +784,7 @@ class RuleBasedExtractor(BaseTaskExtractor):
             source=source,
             source_ref=combined_ref,
             content_hash=content_hash,
+            start_date=start_date,
             due_date=due_date,
             due_time=due_time,
             status=TaskStatus.PENDING,

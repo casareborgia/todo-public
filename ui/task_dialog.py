@@ -1,6 +1,6 @@
 """일정/할일 자유 편집 모달 및 텍스트 붙여넣기 스마트 등록 다이얼로그 (구상 2-4, 2-5)."""
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Callable, Dict, Optional
@@ -32,7 +32,7 @@ class TaskEditDialog(tk.Toplevel):
 
         is_edit = task is not None and task.id is not None
         self.title("업무 일정 편집" if is_edit else "새 업무 일정 등록")
-        self.geometry("580x620")
+        self.geometry("580x660")
         self.configure(bg="#F8FAFC")
         self.transient(parent)
         self.grab_set()
@@ -80,12 +80,21 @@ class TaskEditDialog(tk.Toplevel):
         title_entry.grid(row=0, column=1, sticky="ew", pady=6)
         title_entry.focus_set()
 
-        # 2. 마감 기한 (날짜 + 시각 + 빠른 선택 버튼)
-        tk.Label(form, text="마감 기한 *", font=("Malgun Gothic", 10, "bold"), bg="#F8FAFC", fg="#334155").grid(
+        # 2-1. 기간 업무의 시작일 (빈칸이면 마감 기한만 있는 업무)
+        tk.Label(form, text="시작일 (기간일 때)", font=("Malgun Gothic", 10, "bold"), bg="#F8FAFC", fg="#334155").grid(
             row=1, column=0, sticky="w", pady=6, padx=(0, 12)
         )
+        self.start_date_var = tk.StringVar(value=self.task.start_date if self.task else "")
+        ttk.Entry(form, textvariable=self.start_date_var, width=13, font=("Malgun Gothic", 10)).grid(
+            row=1, column=1, sticky="w", pady=6
+        )
+
+        # 2. 마감 기한 (날짜 + 시각 + 빠른 선택 버튼)
+        tk.Label(form, text="마감 기한 *", font=("Malgun Gothic", 10, "bold"), bg="#F8FAFC", fg="#334155").grid(
+            row=2, column=0, sticky="w", pady=6, padx=(0, 12)
+        )
         due_frame = tk.Frame(form, bg="#F8FAFC")
-        due_frame.grid(row=1, column=1, sticky="w", pady=6)
+        due_frame.grid(row=2, column=1, sticky="w", pady=6)
 
         initial_date = (
             self.task.due_date
@@ -114,7 +123,7 @@ class TaskEditDialog(tk.Toplevel):
 
         # 빠른 기한 버튼줄
         quick_date_frame = tk.Frame(form, bg="#F8FAFC")
-        quick_date_frame.grid(row=2, column=1, sticky="w", pady=(0, 8))
+        quick_date_frame.grid(row=3, column=1, sticky="w", pady=(0, 8))
         for btn_text, delta_days in [("오늘", 0), ("내일", 1), ("+3일", 3), ("이번주 금요일", -1), ("+1주일", 7)]:
             btn = tk.Button(
                 quick_date_frame,
@@ -131,7 +140,7 @@ class TaskEditDialog(tk.Toplevel):
 
         # 3. 색상 라벨 / 카테고리
         tk.Label(form, text="라벨(분류)", font=("Malgun Gothic", 10, "bold"), bg="#F8FAFC", fg="#334155").grid(
-            row=3, column=0, sticky="w", pady=6, padx=(0, 12)
+            row=4, column=0, sticky="w", pady=6, padx=(0, 12)
         )
         self.label_keys = list(self.labels_config.keys())
         self.label_display_map = {
@@ -148,14 +157,14 @@ class TaskEditDialog(tk.Toplevel):
             state="readonly",
             font=("Malgun Gothic", 9),
         )
-        label_combo.grid(row=3, column=1, sticky="ew", pady=6)
+        label_combo.grid(row=4, column=1, sticky="ew", pady=6)
 
         # 4. 진행 상태 & 중요도
         tk.Label(form, text="진행 상태", font=("Malgun Gothic", 10, "bold"), bg="#F8FAFC", fg="#334155").grid(
-            row=4, column=0, sticky="w", pady=6, padx=(0, 12)
+            row=5, column=0, sticky="w", pady=6, padx=(0, 12)
         )
         status_priority_frame = tk.Frame(form, bg="#F8FAFC")
-        status_priority_frame.grid(row=4, column=1, sticky="w", pady=6)
+        status_priority_frame.grid(row=5, column=1, sticky="w", pady=6)
 
         self.status_map = TaskStatus.ALL_LABELS
         self.rev_status_map = {v: k for k, v in self.status_map.items()}
@@ -189,7 +198,7 @@ class TaskEditDialog(tk.Toplevel):
 
         # 5. 반복 일정 설정 (구상 2-5 승인 기능)
         tk.Label(form, text="반복 설정", font=("Malgun Gothic", 10, "bold"), bg="#F8FAFC", fg="#334155").grid(
-            row=5, column=0, sticky="w", pady=6, padx=(0, 12)
+            row=6, column=0, sticky="w", pady=6, padx=(0, 12)
         )
         self.recur_map = RecurrenceType.ALL_LABELS
         self.rev_recur_map = {v: k for k, v in self.recur_map.items()}
@@ -202,20 +211,20 @@ class TaskEditDialog(tk.Toplevel):
             values=list(self.recur_map.values()),
             state="readonly",
             font=("Malgun Gothic", 9),
-        ).grid(row=5, column=1, sticky="w", pady=6)
+        ).grid(row=6, column=1, sticky="w", pady=6)
 
         # 6. 출처 / 문서번호 메타정보
         tk.Label(form, text="문서번호/발신", font=("Malgun Gothic", 10, "bold"), bg="#F8FAFC", fg="#334155").grid(
-            row=6, column=0, sticky="w", pady=6, padx=(0, 12)
+            row=7, column=0, sticky="w", pady=6, padx=(0, 12)
         )
         self.source_ref_var = tk.StringVar(value=self.task.source_ref if self.task else "")
         ttk.Entry(form, textvariable=self.source_ref_var, font=("Malgun Gothic", 9)).grid(
-            row=6, column=1, sticky="ew", pady=6
+            row=7, column=1, sticky="ew", pady=6
         )
 
         # 7. 상세 내용 / 원본 메시지
         tk.Label(form, text="상세 내용", font=("Malgun Gothic", 10, "bold"), bg="#F8FAFC", fg="#334155").grid(
-            row=7, column=0, sticky="nw", pady=6, padx=(0, 12)
+            row=8, column=0, sticky="nw", pady=6, padx=(0, 12)
         )
         self.desc_text = tk.Text(
             form,
@@ -227,8 +236,8 @@ class TaskEditDialog(tk.Toplevel):
             padx=6,
             pady=6,
         )
-        self.desc_text.grid(row=7, column=1, sticky="nsew", pady=6)
-        form.rowconfigure(7, weight=1)
+        self.desc_text.grid(row=8, column=1, sticky="nsew", pady=6)
+        form.rowconfigure(8, weight=1)
         if self.task and self.task.description:
             self.desc_text.insert("1.0", self.task.description)
 
@@ -291,6 +300,17 @@ class TaskEditDialog(tk.Toplevel):
 
         due_date = self.due_date_var.get().strip()
         due_time = self.due_time_var.get().strip() or "18:00"
+        start_date = self.start_date_var.get().strip()
+        if start_date:
+            try:
+                ok = datetime.strptime(start_date, "%Y-%m-%d") <= datetime.strptime(due_date, "%Y-%m-%d")
+            except ValueError:
+                ok = False
+            if not ok:
+                messagebox.showwarning(
+                    "입력 확인", "시작일은 YYYY-MM-DD 형식이고 마감일보다 늦지 않아야 합니다.", parent=self
+                )
+                return
         label_key = self.rev_label_map.get(self.label_var.get(), "MANUAL")
         status_key = self.rev_status_map.get(self.status_var.get(), TaskStatus.PENDING)
         priority_val = self.rev_priority_map.get(self.priority_var.get(), 2)
@@ -303,6 +323,7 @@ class TaskEditDialog(tk.Toplevel):
             if (due_date, due_time) != (self.task.due_date, self.task.due_time):
                 self.task.due_estimated = False  # 사용자가 직접 정한 기한은 확정값
             self.task.title = title
+            self.task.start_date = start_date  # 마감일과 같으면 DB가 ''로 저장
             self.task.due_date = due_date
             self.task.due_time = due_time
             self.task.label = label_key
@@ -324,6 +345,7 @@ class TaskEditDialog(tk.Toplevel):
                 description=description,
                 source=source_map.get(label_key, TaskSource.MANUAL),
                 source_ref=source_ref,
+                start_date=start_date,
                 due_date=due_date,
                 due_time=due_time,
                 status=status_key,

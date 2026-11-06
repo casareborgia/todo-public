@@ -13,7 +13,7 @@ from typing import Optional
 
 from core.database import compute_content_hash
 from core.models import TaskItem, TaskSource, TaskStatus
-from parsers.rule_parser import RuleBasedExtractor
+from parsers.rule_parser import PERIOD_RE, RuleBasedExtractor
 
 _WEEKS = r"(?:이번\s*주|금주|다음\s*주|차주|다다음\s*주)"
 # 숫자로 쓴 날짜: 실제로 날짜를 찾았을 때만 제목에서 지움 ('1.5배' 같은 숫자 보호)
@@ -117,7 +117,16 @@ def parse_quick_entry(
     if due_time == extractor.default_time:
         due_time = _fallback_time(line, due_time)
 
-    title = strip_date_words(line, numeric_dates=date_found)
+    # 기간 ('11/10~11/14 교육 이수'): 끝 날짜가 기한과 같을 때만 시작일로 씀. 제목에서는 기간 글자를 통째로 지움
+    # ('~'와 끝 일만 쓴 '~14'는 날짜 지우기로 안 지워짐)
+    start_date = ""
+    title_src = line
+    period = extractor.extract_period(line, ref_date=today) if date_found and not estimated else None
+    if period and period[1].isoformat() == due_date:
+        start_date = period[0].isoformat()
+        title_src = PERIOD_RE.sub(" ", line)
+
+    title = strip_date_words(title_src, numeric_dates=date_found)
     if len(title) < 2:
         title = line
     if len(title) > 75:
@@ -132,6 +141,7 @@ def parse_quick_entry(
         source=TaskSource.MANUAL,
         source_ref="빠른 입력",
         content_hash=compute_content_hash(title, f"빠른 입력|{now}", line),
+        start_date=start_date,
         due_date=due_date,
         due_time=due_time,
         status=TaskStatus.PENDING,

@@ -69,12 +69,25 @@ class TaskItem:
     due_estimated: bool = False      # 원본에 기한이 없어 기본값으로 추정한 기한인지 (PDF 등으로 확정되면 False)
     needs_review: bool = False       # 업무인지 애매해 사용자 확인을 기다리는 쪽지 업무 (캘린더·알림에서 빠짐)
     ezq_key: str = ""                # 업무가 나온 EzQ 쪽지 키 (판정 기록 ezq_messages.msg_key)
+    start_date: str = ""             # 기간 업무의 시작일 (YYYY-MM-DD). 빈 값이면 일반 마감 업무. due_date가 기간의 끝
     match_keys: List[str] = field(default_factory=list)  # 기존 업무 매칭용 보조 키 (DB 저장 안 함)
     is_preview: bool = False         # 캘린더에만 그리는 반복 업무의 다음 날짜 미리보기 (DB 저장 안 함)
 
     @property
     def is_completed(self) -> bool:
         return self.status == TaskStatus.COMPLETED
+
+    @property
+    def is_period(self) -> bool:
+        """시작일이 마감일보다 앞선 기간 업무인지 (하루짜리는 마감 업무)."""
+        return bool(self.start_date) and bool(self.due_date) and self.start_date < self.due_date
+
+    def period_label(self) -> str:
+        """기간 업무의 'MM/DD~MM/DD' 표기. 기간 업무가 아니면 빈 문자열."""
+        if not self.is_period:
+            return ""
+        s, d = self.start_date, self.due_date
+        return f"{s[5:7]}/{s[8:10]}~{d[5:7]}/{d[8:10]}"
 
     def is_overdue(self, ref_date: Optional[date] = None) -> bool:
         """기한이 지났으나 완료되지 않은(자동 이월 대상) 업무인지 판단."""

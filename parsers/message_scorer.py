@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import List
 
 from parsers.portal_parser import REFERS_TO_QUOTE_RE
-from parsers.rule_parser import REPLY_LEFTOVER_RE, REPLY_PHRASE_RE
+from parsers.rule_parser import PERIOD_DAY_END_TAIL, REPLY_LEFTOVER_RE, REPLY_PHRASE_RE
 
 REGISTER = "등록"
 REVIEW = "확인 필요"
@@ -38,15 +38,33 @@ REQUEST_RE = re.compile(
     r"|바람(?=\s*(?:[.!,~]|$))",
     re.MULTILINE,
 )
+# 공문의 통보형 맺음말 ('참고하여 주시기 바랍니다', '유의하시기 바랍니다'). 할 일을 부탁하는 말이 아니라서
+# 부탁 표현에서 빼고 공지·공유로 감점함 (실제 공문 표본 2026-11-06)
+NOTICE_ASK_RE = re.compile(r"(?:참고|유의|숙지)\s*(?:(?:하여|해|하시기)\s*)?(?:주시기\s*)?바랍니다")
+
+
+def has_request(text: str) -> bool:
+    """부탁 표현이 있는지 (통보형 맺음말은 부탁 표현으로 치지 않음)."""
+    return bool(REQUEST_RE.search(NOTICE_ASK_RE.sub(" ", text)))
+
+
 _DATE = r"\d{1,2}\s*[월/.]\s*\d{1,2}\s*일?\.?"
 # 날짜·요일과 '까지' 사이의 시각: '오전', '오후 3시', '오전 10시 30분', '3시 반', '14:00'
 _HOUR = r"\d{1,2}\s*시(?:\s*(?:\d{1,2}\s*분|반))?"
 _TOD = r"(?:(?:(?:오전|오후|낮|저녁)\s*(?:" + _HOUR + r")?|" + _HOUR + r"|\d{1,2}:\d{2})\s*)?"
+# 기간 표현도 명시 기한 ('~ 2026.11.20', '11.10.-11.14.', '11/10~14'). '-'는 앞뒤 모두 날짜일 때만 (문서번호 '감사실-123' 제외)
+PERIOD_RE = (
+    r"~\s*(?:20)?\d{2}\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}"
+    + r"|" + _DATE + r"\s*(?:\([월화수목금토일]\))?\s*-\s*" + _DATE
+    # 끝이 일만: 끝 일 뒤 경계는 규칙 파서와 같음 ('3~4명', '14~16시', '~3쪽'은 기한 아님)
+    + r"|" + _DATE + r"\s*~\s*\d{1,2}" + PERIOD_DAY_END_TAIL
+)
 DEADLINE_RE = re.compile(
     _DATE + r"\s*(?:\([월화수목금토일]\))?\s*" + _TOD + r"(?:까지|내로|이내)"
     + r"|(?:[월화수목금토일]요일|\d{1,2}일)\s*" + _TOD + r"(?:까지|내로)"
     + r"|~\s*'?(?:\d{2}\.\s*)?" + _DATE
     + r"|기한|마감|(?:오늘|금일|내일|모레|금주|이번\s*주|다음\s*주|차주)\s*" + _TOD + r"(?:까지|중)"
+    + r"|" + PERIOD_RE
 )
 # 날짜처럼 보이는 말 (기한 표현은 아님). 부탁 표현 없는 짧은 지시('회의자료 제출 11/5')를 살리는 데만 씀
 LOOSE_DATE_RE = re.compile(_DATE + r"|오늘|금일|내일|모레|[월화수목금]요일")
@@ -58,11 +76,17 @@ PENALTIES = [
     ("공지·공유", re.compile(
         r"\[[^\]\n]*(?:공지|안내|알림|속보|소식)[^\]\n]*\]|알려\s*드립니다|공유\s*(?:드립니다|합니다)"
         r"|전달\s*드립니다|속보|소식지|참고\s*(?:하시기\s*)?바랍니다|참고하세요"
+        # 공문의 통보형 표현 ('안내해드립니다', '참고하여 주시기 바랍니다')
+        r"|안내\s*(?:해\s*)?드립니다|" + NOTICE_ASK_RE.pattern
     ), -3),
     ("회의 내용 전달", re.compile(r"회의\s*(?:내용|결과)|회의록|지시\s*사항|전달\s*사항"), -2),
     ("완료 보고", re.compile(r"(?:했|하였|올렸|보내\s*드렸|첨부했|드렸|마쳤)습니다|요청하신"), -2),
     ("선택형", re.compile(r"필요하시면|원하시면|희망하시면"), -1),
 ]
+
+# 알리면서 다음 말로 잇는 공문 표현 ('…을 알려드리오니', '안내드리며'). 뒤에 부탁이 붙어도 대개 통보라 공지·공유로 감점.
+# 다만 명시 기한이 있으면(공모 '접수기간 ~11.20') 기한 안에 할 일을 알리는 것이라 감점하지 않음
+NOTICE_LEAD_RE = re.compile(r"알려\s*드리(?:오니|니|며)|안내\s*(?:해\s*)?드리(?:오니|니|며)")
 
 # 시스템이 보내는 알림 쪽지. 문서·메일 제목에 업무 단어('결재·공람·제출 요청')가 섞여도 업무가 아님
 # (실제 공문은 PDF 경로로 따로 들어옴). 실사용 표본 2026-11-03:
@@ -114,6 +138,12 @@ def _is_reply_only(text: str) -> bool:
     return bool(REPLY_LEFTOVER_RE.fullmatch(REPLY_PHRASE_RE.sub("", text)))
 
 
+def has_deadline_task_line(text: str) -> bool:
+    """기한과 부탁·업무 명사가 같은 줄에 있는지 ('검토는 11.7.(금)까지')."""
+    return any(DEADLINE_RE.search(line) and (has_request(line) or TASK_NOUN_RE.search(line))
+               for line in text.splitlines())
+
+
 def score_message(top: str, quoted: str = "") -> ScoreResult:
     """맨 위 받은 글(top)을 점수로 판정. 인용된 글을 가리키면 첫 인용 글(quoted)도 함께 봄."""
     top = (top or "").strip()
@@ -134,21 +164,22 @@ def score_message(top: str, quoted: str = "") -> ScoreResult:
         result.score += points
         result.reasons.append(f"{name} {points:+d}")
 
-    if REQUEST_RE.search(text):
+    if has_request(text):
         add("부탁 표현", 3)
     if DEADLINE_RE.search(text):
         add("명시 기한", 2)
-    if any(DEADLINE_RE.search(line) and (REQUEST_RE.search(line) or TASK_NOUN_RE.search(line))
-           for line in text.splitlines()):
+    if has_deadline_task_line(text):
         add("기한과 부탁·업무가 같은 줄", 3)
     if TASK_NOUN_RE.search(text):
         add("업무 명사", 1)
     # 맨 위 글이 직접 요청하면('아래 내용 처리 좀 해주세요') 인용 글은 가점 근거로만 쓰고 감점은 맨 위 글로만 판단.
     # 요청 없이 전달만 하면('아래 공지 전달드립니다') 인용된 공지의 감점도 적용
-    penalty_text = top if REQUEST_RE.search(top) else text
+    penalty_text = top if has_request(top) else text
     for name, pattern, points in PENALTIES:
         if pattern.search(penalty_text):
             add(name, points)
+    if "공지·공유 -3" not in result.reasons and NOTICE_LEAD_RE.search(penalty_text) and not DEADLINE_RE.search(text):
+        add("공지·공유", -3)
 
     if result.score >= REGISTER_MIN:
         if DEADLINE_RE.search(text) or MATERIAL_RE.search(text):
@@ -158,7 +189,7 @@ def score_message(top: str, quoted: str = "") -> ScoreResult:
             result.reasons.append("기한·첨부·공문 없는 요청 → 확인 필요")
     elif result.score >= REVIEW_MIN:
         # 업무 명사 하나뿐인 잡담('검토해보니 괜찮네요')은 제외. 부탁·기한·날짜 중 하나는 있어야 확인 필요
-        if REQUEST_RE.search(text) or DEADLINE_RE.search(text) or LOOSE_DATE_RE.search(text):
+        if has_request(text) or DEADLINE_RE.search(text) or LOOSE_DATE_RE.search(text):
             result.verdict = REVIEW
         else:
             result.reasons.append("업무 명사만 있음 → 제외")
