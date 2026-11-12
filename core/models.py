@@ -2,7 +2,17 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime, date
+from functools import lru_cache
 from typing import List, Optional
+
+
+@lru_cache(maxsize=4096)
+def parse_ymd(ds: str) -> Optional[date]:
+    """'YYYY-MM-DD' → date. 형식이 아니면 None. 달력을 그릴 때 같은 날짜를 수천 번 읽어서 결과를 기억해 둠."""
+    try:
+        return datetime.strptime(ds, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
 
 
 class TaskStatus:
@@ -70,6 +80,7 @@ class TaskItem:
     needs_review: bool = False       # 업무인지 애매해 사용자 확인을 기다리는 쪽지 업무 (캘린더·알림에서 빠짐)
     ezq_key: str = ""                # 업무가 나온 EzQ 쪽지 키 (판정 기록 ezq_messages.msg_key)
     start_date: str = ""             # 기간 업무의 시작일 (YYYY-MM-DD). 빈 값이면 일반 마감 업무. due_date가 기간의 끝
+    recur_day: int = 0               # 매월 반복의 원래 날짜(1~31). 0이면 마감일의 날짜. 31일 업무가 2월에 28일이 돼도 3월엔 31일로
     match_keys: List[str] = field(default_factory=list)  # 기존 업무 매칭용 보조 키 (DB 저장 안 함)
     is_preview: bool = False         # 캘린더에만 그리는 반복 업무의 다음 날짜 미리보기 (DB 저장 안 함)
 
@@ -94,22 +105,16 @@ class TaskItem:
         if self.is_completed or not self.due_date:
             return False
         today = ref_date or date.today()
-        try:
-            d = datetime.strptime(self.due_date, "%Y-%m-%d").date()
-            return d < today
-        except ValueError:
-            return False
+        d = parse_ymd(self.due_date)
+        return d is not None and d < today
 
     def days_remaining(self, ref_date: Optional[date] = None) -> Optional[int]:
         """오늘 기준 남은 일수 (음수이면 기한 경과 일수)."""
         if not self.due_date:
             return None
         today = ref_date or date.today()
-        try:
-            d = datetime.strptime(self.due_date, "%Y-%m-%d").date()
-            return (d - today).days
-        except ValueError:
-            return None
+        d = parse_ymd(self.due_date)
+        return (d - today).days if d is not None else None
 
     def d_day_badge(self, ref_date: Optional[date] = None) -> str:
         """D-Day 표시 문자열 반환."""

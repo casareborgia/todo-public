@@ -1,6 +1,6 @@
 {
   "app_name": "사내 업무 캘린더 & 투두 매니저",
-  "version": "1.4.0",
+  "version": "1.5.1",
   "watch_folders": [
     "./scan_inbox"
   ],

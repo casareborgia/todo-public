@@ -13,3 +13,6 @@ scan_inbox/*
 build/
 dist/
 *.spec
+
+# 소스 실행 꾸러미에 동봉하는 파이썬 본체
+runtime/

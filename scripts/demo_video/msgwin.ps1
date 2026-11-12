@@ -1,11 +1,12 @@
-﻿param([string]$Sender, [string]$Sent, [string]$BodyFile)
+﻿param([string]$Sender, [string]$Sent, [string]$BodyFile, [int]$X = 1280, [int]$Y = 120, [switch]$TopMost)
 # 시연용 재현 쪽지 창 (EzQ 받은쪽지 창처럼 본문을 내장 IE 화면에 표시)
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 $body = [IO.File]::ReadAllText($BodyFile, [Text.Encoding]::UTF8)
 $f = New-Object Windows.Forms.Form
 $f.Text = '받은쪽지 (시연용 재현)'
 $f.ClientSize = New-Object Drawing.Size 600, 300
-$f.StartPosition = 'Manual'; $f.Location = New-Object Drawing.Point 1280, 120
+$f.StartPosition = 'Manual'; $f.Location = New-Object Drawing.Point $X, $Y
+if ($TopMost) { $f.TopMost = $true }
 $f.BackColor = [Drawing.Color]::White
 $f.FormBorderStyle = 'FixedSingle'; $f.MaximizeBox = $false
 $head = New-Object Windows.Forms.Panel; $head.Dock = 'Top'; $head.Height = 64; $head.BackColor = [Drawing.Color]::FromArgb(241, 245, 249)

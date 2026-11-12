@@ -55,7 +55,10 @@ def copy_app() -> None:
     subprocess.run(["git", "-C", REPO, "archive", "--format=zip", "-o", archive, "HEAD"], check=True)
     with zipfile.ZipFile(archive) as z:  # 한글 파일 이름 때문에 tar 대신 zip
         z.extractall(APP)
-    os.remove(archive)
+    try:
+        os.remove(archive)
+    except PermissionError:  # 보안 프로그램이 zip을 검사하느라 잠깐 잡고 있을 때
+        pass
     for p in glob.glob(os.path.join(APP, "scan_inbox", "*")):
         os.remove(p)
     cfg = json.load(open(os.path.join(APP, "config.json"), encoding="utf-8"))

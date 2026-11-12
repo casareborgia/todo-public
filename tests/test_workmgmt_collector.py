@@ -232,7 +232,7 @@ class DistributedListBase(WorkMgmtTestBase):
 
 
 class TestDistributedList(DistributedListBase):
-    """결재시행 목록의 배부받은 문서 → 업무 (기한은 문서를 열 때 정함)."""
+    """결재시행 목록의 배부받은 문서 → '확인 필요' 업무 (업무인지와 기한은 문서를 열 때 본문으로 정함)."""
 
     def test_distributed_row_creates_estimated_task(self):
         created = self.collector_with_rows([lrow()]).collect_and_register()
@@ -240,7 +240,7 @@ class TestDistributedList(DistributedListBase):
         t = self.db.find_task_by_keys(["DOC:계약부-77"])
         self.assertEqual(t.title, "가상 안전점검 계획 협조")
         self.assertTrue(t.due_estimated)
-        self.assertFalse(t.needs_review)
+        self.assertTrue(t.needs_review)  # 업무담당자 배부도 목록만으로는 확인 필요 (안내·통보 공문 과탐 방지)
         self.assertEqual(t.source, TaskSource.PORTAL)
         self.assertIn(WORKMGMT_LIST_SOURCE_REF, t.source_ref)
         self.assertTrue(t.description.startswith("[업무관리시스템 배부 2026-11-03 17:50 확인]"))
@@ -272,7 +272,7 @@ class TestDistributedList(DistributedListBase):
         self.db.delete_task(self.db.find_task_by_keys(["DOC:계약부-77"]).id)
         c2 = self.collector_with_rows([lrow()])
         self.assertEqual(c2.collect_and_register(), [])
-        self.assertEqual(self.db.get_workmgmt_doc("LIST:DOC:계약부-77")["result"], "등록")
+        self.assertEqual(self.db.get_workmgmt_doc("LIST:DOC:계약부-77")["result"], "확인 필요")
 
     def test_row_without_doc_no_uses_title_key(self):
         self.collector_with_rows([lrow(no="")]).collect_and_register()
@@ -448,7 +448,7 @@ class TestDismissListTask(DistributedListBase):
         self.assertFalse(self.collector.is_list_task(TaskItem(title="x", source=TaskSource.MESSENGER, source_ref="EzQ 쪽지")))
 
     def test_review_reason(self):
-        self.assertEqual(self.collector.review_reason(self.manager_task()), "업무관리자로 지정된 배부 문서 (처리구분: 업무관리자)")
+        self.assertEqual(self.collector.review_reason(self.manager_task()), "배부 문서: 문서를 열면 본문으로 업무인지 판정합니다 (처리구분: 업무관리자)")
 
     def test_dismiss_list_task_then_open_body_not_recreated(self):
         t = self.manager_task()
@@ -559,13 +559,13 @@ class TestReviewFixes(DistributedListBase):
         c.collect_and_register()
         self.assertEqual(len(self.open_tasks()), 2)
 
-    def test_assigned_distribution_confirms_review_message_and_is_list_task(self):  # 지적 5
+    def test_assigned_distribution_keeps_review_message_review_and_is_list_task(self):  # 지적 5
         msg_id = self.add_messenger("내부통제 자가진단 결과 제출 부탁드립니다", "내부통제 자가진단 결과 제출 부탁드립니다",
                                     needs_review=True)
         c = self.collector_with_rows([lrow(no="계약부-901", title=FULL_TITLE)])
         c.collect_and_register()
         merged = self.db.get_task(msg_id)
-        self.assertFalse(merged.needs_review)  # 업무담당자 배부는 확실한 원본
+        self.assertTrue(merged.needs_review)  # 배부만으로는 확정하지 않음 (본문을 읽으면 정해짐)
         self.assertTrue(c.is_list_task(merged))
         self.assertEqual(c.dismiss_task(merged), "LIST:DOC:계약부-901")
         self.assertEqual(self.db.get_workmgmt_doc("LIST:DOC:계약부-901")["result"], "업무 아님")

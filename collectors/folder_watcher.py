@@ -10,9 +10,10 @@
 
 import hashlib
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from collectors.base_collector import BaseCollector
 from core.database import DatabaseManager
@@ -96,6 +97,9 @@ class FolderWatcherCollector(BaseCollector):
                 or [".txt", ".html", ".htm", ".md", ".log", ".json", ".pdf"]
             )
         ]
+        # 확인했는데 바뀌지 않은 파일 → 그때의 수정 시각. 15초마다 파일마다 DB를 여는 대신 메모리에서 비교
+        # (파일 5천 개 폴더에서 다음 확인이 3~6초 걸려 같은 스레드의 쪽지 수집·알림까지 늦어졌음)
+        self._known_mtimes: Dict[str, float] = {}
         self._ensure_folders()
 
     @property
@@ -132,11 +136,13 @@ class FolderWatcherCollector(BaseCollector):
         return h.hexdigest()
 
     def scan_file(
-        self, file_path: str, force: bool = False, folder: Optional[WatchFolder] = None
+        self, file_path: str, force: bool = False, folder: Optional[WatchFolder] = None,
+        mtime: Optional[float] = None,
     ) -> FileScanResult:
-        """파일 하나를 확인해 업무를 등록하고, 무엇을 했는지 결과로 돌려줌."""
-        if not os.path.isfile(file_path):
-            return FileScanResult(file_path, EXCLUDED_PREFIX + "파일 없음")
+        """파일 하나를 확인해 업무를 등록하고, 무엇을 했는지 결과로 돌려줌.
+
+        mtime: 폴더를 훑을 때 이미 얻은 수정 시각 (있으면 디스크를 다시 묻지 않음)."""
+        # 이름·확장자로 거를 수 있는 건 디스크를 묻기 전에 거름
         ext = os.path.splitext(file_path)[1].lower()
         if ext not in self.supported_extensions:
             return FileScanResult(file_path, EXCLUDED_PREFIX + "지원하지 않는 형식")
@@ -144,17 +150,24 @@ class FolderWatcherCollector(BaseCollector):
         if work_only and not is_work_file_name(file_path):
             return FileScanResult(file_path, EXCLUDED_PREFIX + "쪽지·공문 파일 아님")
 
-        try:
-            mtime = os.path.getmtime(file_path)
-        except OSError:
-            return FileScanResult(file_path, OUTCOME_FAILED)
+        if mtime is None:
+            if not os.path.isfile(file_path):
+                return FileScanResult(file_path, EXCLUDED_PREFIX + "파일 없음")
+            try:
+                mtime = os.path.getmtime(file_path)
+            except OSError:
+                return FileScanResult(file_path, OUTCOME_FAILED)
         since = folder.since_timestamp() if folder else None
         if since is not None and mtime < since:
             return FileScanResult(file_path, EXCLUDED_PREFIX + f"{folder.since} 이전 파일")
 
         # 수정 시각이 같으면 내용을 다시 읽지 않음 (큰 폴더를 15초마다 확인해도 PC가 느려지지 않게)
+        key = os.path.abspath(file_path)
+        if not force and self._known_mtimes.get(key) == mtime:
+            return FileScanResult(file_path, OUTCOME_UNCHANGED)
         previous = None if force else self.db.get_scanned_file(file_path)
         if previous and previous["file_mtime"] == mtime:
+            self._known_mtimes[key] = mtime
             return FileScanResult(file_path, OUTCOME_UNCHANGED)
         try:
             f_hash = self._compute_file_hash(file_path)
@@ -163,6 +176,7 @@ class FolderWatcherCollector(BaseCollector):
         if previous and previous["file_hash"] == f_hash:
             # 내용은 같고 시각만 바뀜 (다시 저장·복사): 시각만 기록해 다음부터 건너뜀
             self.db.record_scanned_file(file_path, mtime, f_hash, previous["extracted_count"] or 0)
+            self._known_mtimes[key] = mtime
             return FileScanResult(file_path, OUTCOME_UNCHANGED)
 
         try:
@@ -181,31 +195,63 @@ class FolderWatcherCollector(BaseCollector):
                 created.append(item)
 
         self.db.record_scanned_file(file_path, mtime, f_hash, len(created))
+        self._known_mtimes[key] = mtime
         return FileScanResult(file_path, _outcome(items, actions, created), items, created)
 
     def scan_single_file(self, file_path: str, force: bool = False) -> List[TaskItem]:
         """단일 파일을 파싱하여 신규 업무를 DB에 등록 (새로 등록된 업무만 반환)."""
         return self.scan_file(file_path, force=force).created
 
-    def scan_folder(self, folder: WatchFolder, force: bool = False) -> List[FileScanResult]:
+    def scan_folder(
+        self, folder: WatchFolder, force: bool = False, deadline: Optional[float] = None
+    ) -> List[FileScanResult]:
+        """deadline(time.monotonic 기준)을 넘기면 거기서 멈춤. 남은 파일은 다음 확인 때 이어서 처리됨
+        (이미 확인한 파일은 수정 시각 비교로 바로 건너뛰므로)."""
         results: List[FileScanResult] = []
         if not os.path.isdir(folder.path):
             return results
-        for root_dir, _, files in os.walk(folder.path):
-            for fname in sorted(files):
-                # 안내용 README 파일과 .gitkeep 같은 숨김 파일은 스캔에서 제외
-                if fname.lower().startswith("readme") or fname.startswith("."):
-                    continue
-                results.append(self.scan_file(os.path.join(root_dir, fname), force=force, folder=folder))
+        for path, mtime in _walk_files(folder.path):
+            # 안내용 README 파일과 .gitkeep 같은 숨김 파일은 스캔에서 제외
+            fname = os.path.basename(path)
+            if fname.lower().startswith("readme") or fname.startswith("."):
+                continue
+            if deadline is not None and time.monotonic() > deadline:
+                break
+            results.append(self.scan_file(path, force=force, folder=folder, mtime=mtime))
         return results
 
-    def scan_all(self, force: bool = False) -> List[FileScanResult]:
+    def scan_all(self, force: bool = False, deadline: Optional[float] = None) -> List[FileScanResult]:
         self._ensure_folders()
-        return [r for folder in self.folders for r in self.scan_folder(folder, force=force)]
+        return [r for folder in self.folders for r in self.scan_folder(folder, force=force, deadline=deadline)]
 
-    def collect_and_register(self, force: bool = False) -> List[TaskItem]:
-        """감시 대상 폴더 내의 모든 지원 파일을 스캔하여 신규 업무를 등록."""
-        return [t for r in self.scan_all(force=force) for t in r.created]
+    def collect_and_register(self, force: bool = False, time_budget: Optional[float] = None) -> List[TaskItem]:
+        """감시 대상 폴더 내의 모든 지원 파일을 스캔하여 신규 업무를 등록.
+
+        time_budget(초): 한 번에 쓸 최대 시간. 큰 폴더를 '전체 파일'로 처음 가져올 때 1~2분씩 걸려
+        같은 스레드의 쪽지 수집·알림과 시작 화면이 멈추던 것을, 여러 번의 확인에 나눠 처리함."""
+        deadline = time.monotonic() + time_budget if time_budget else None
+        return [t for r in self.scan_all(force=force, deadline=deadline) for t in r.created]
+
+
+def _walk_files(top: str):
+    """(파일 경로, 수정 시각)을 이름순으로. os.scandir는 Windows에서 파일 종류·수정 시각을 목록과 함께 받아
+    파일마다 디스크를 다시 묻지 않음 (os.walk + isfile + getmtime은 파일 5천 개에 1초 넘게 걸렸음)."""
+    try:
+        with os.scandir(top) as it:
+            entries = sorted(it, key=lambda e: e.name)
+    except OSError:
+        return
+    subdirs = []
+    for entry in entries:
+        try:
+            if entry.is_file():
+                yield entry.path, entry.stat().st_mtime
+            elif entry.is_dir(follow_symlinks=False):
+                subdirs.append(entry.path)
+        except OSError:
+            continue
+    for sub in subdirs:
+        yield from _walk_files(sub)
 
 
 def _outcome(items: List[TaskItem], actions: List[str], created: List[TaskItem]) -> str:

@@ -31,9 +31,9 @@ _WORD_DATE_PATTERNS = [
     r"오늘|금일|내일|명일|모레|글피",
 ]
 _TIME_PATTERNS = [
-    r"(?:오전|오후)\s*\d{1,2}\s*(?:시\s*(?:\d{1,2}\s*분|반)?|:\s*\d{2})",
+    r"(?:오전|오후)\s*\d{1,2}\s*(?:시(?!간)\s*(?:\d{1,2}\s*분|반)?|:\s*\d{2})",
     r"(?<![\d:])\d{1,2}\s*:\s*\d{2}",
-    r"\d{1,2}\s*시\s*(?:\d{1,2}\s*분|반)?",
+    r"\d{1,2}\s*시(?!간)\s*(?:\d{1,2}\s*분|반)?",
     r"오전|오후|점심\s*전",
 ]
 
@@ -70,7 +70,7 @@ def _fallback_date(line: str, today: date) -> Optional[date]:
 
 def _fallback_time(line: str, default_time: str) -> str:
     """'14:00', '3시', '오후 2시 반'처럼 '까지' 없이 적은 시각."""
-    m = re.search(r"(오전|오후)\s*(\d{1,2})\s*(?:시\s*(?:(\d{1,2})\s*분|(반))?|:\s*(\d{2}))", line)
+    m = re.search(r"(오전|오후)\s*(\d{1,2})\s*(?:시(?!간)\s*(?:(\d{1,2})\s*분|(반))?|:\s*(\d{2}))", line)
     if m:
         hh = int(m.group(2))
         mm = 30 if m.group(4) else int(m.group(3) or m.group(5) or 0)
@@ -83,7 +83,7 @@ def _fallback_time(line: str, default_time: str) -> str:
         if m:
             hh, mm = int(m.group(1)), int(m.group(2))
         else:
-            m = re.search(r"(?<!\d)(\d{1,2})\s*시\s*(?:(\d{1,2})\s*분|(반))?", line)
+            m = re.search(r"(?<!\d)(\d{1,2})\s*시(?!간)\s*(?:(\d{1,2})\s*분|(반))?", line)
             if not m:
                 return default_time
             hh = int(m.group(1))

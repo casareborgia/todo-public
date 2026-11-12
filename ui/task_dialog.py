@@ -1,6 +1,7 @@
 """일정/할일 자유 편집 모달 및 텍스트 붙여넣기 스마트 등록 다이얼로그 (구상 2-4, 2-5)."""
 
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
+import re
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Callable, Dict, Optional
@@ -11,6 +12,45 @@ from core.models import RecurrenceType, TaskItem, TaskSource, TaskStatus
 
 
 from core.recurrence import label_for_recurrence
+
+def normalize_date_input(text: str) -> Optional[str]:
+    """입력한 날짜를 YYYY-MM-DD로. '2026-11-5', '2026.11.5', '2026/11/05'도 받음. 틀리면 None.
+
+    0을 빼고 쓴 날짜를 그대로 저장하면 문자열 비교·검색이 어긋나 캘린더·목록에서 사라졌음."""
+    parts = [p for p in re.split(r"\s*[-./]\s*", (text or "").strip().rstrip(".")) if p]
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        return None
+    try:
+        return date(int(parts[0]), int(parts[1]), int(parts[2])).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def normalize_time_input(text: str) -> Optional[str]:
+    """입력한 시각을 HH:MM으로 ('9:00' → '09:00'). 빈 값은 18:00, 틀리면 None."""
+    text = (text or "").strip()
+    if not text:
+        return "18:00"
+    m = re.fullmatch(r"(\d{1,2})\s*:\s*(\d{2})", text)
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        return None
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
+def apply_edit(fresh: TaskItem, before: TaskItem, values: Dict) -> TaskItem:
+    """편집 창의 값을 DB에서 다시 읽은 업무(fresh)에 덮어씀.
+
+    창을 연 뒤 알림·다시 알림·수집기 병합으로 바뀐 다른 칸은 그대로 두고,
+    마감일·시각을 바꿨으면 알림 상태(보낸 알림·다시 알림)를 초기화해 새 기한에 다시 알리게 함."""
+    if (values["due_date"], values["due_time"]) != (before.due_date, before.due_time):
+        fresh.due_estimated = False  # 사용자가 직접 정한 기한은 확정값
+        fresh.notified_at = None
+        fresh.snooze_until = None
+    for key, value in values.items():
+        setattr(fresh, key, value)
+    fresh.is_new_scan = False
+    return fresh
+
 
 class TaskEditDialog(tk.Toplevel):
     """할 일(TaskItem) 추가 및 자유 편집 모달 창."""
@@ -35,6 +75,12 @@ class TaskEditDialog(tk.Toplevel):
         self.geometry("580x660")
         self.configure(bg="#F8FAFC")
         self.transient(parent)
+        # 항상 위 창(출근 브리핑)에서 열면 이 창도 항상 위로: 아니면 브리핑 뒤에 가려진 채 다른 클릭만 막힘
+        try:
+            if bool(int(parent.winfo_toplevel().attributes("-topmost"))):
+                self.attributes("-topmost", True)
+        except (tk.TclError, ValueError, AttributeError):
+            pass
         self.grab_set()
 
         self._build_ui(is_edit, default_date)
@@ -298,15 +344,18 @@ class TaskEditDialog(tk.Toplevel):
             messagebox.showwarning("입력 확인", "업무 제목을 입력해 주세요.", parent=self)
             return
 
-        due_date = self.due_date_var.get().strip()
-        due_time = self.due_time_var.get().strip() or "18:00"
-        start_date = self.start_date_var.get().strip()
-        if start_date:
-            try:
-                ok = datetime.strptime(start_date, "%Y-%m-%d") <= datetime.strptime(due_date, "%Y-%m-%d")
-            except ValueError:
-                ok = False
-            if not ok:
+        due_date = normalize_date_input(self.due_date_var.get())
+        if due_date is None:
+            messagebox.showwarning("입력 확인", "마감 기한을 YYYY-MM-DD 형식으로 입력해 주세요. (예: 2026-11-20)", parent=self)
+            return
+        due_time = normalize_time_input(self.due_time_var.get())
+        if due_time is None:
+            messagebox.showwarning("입력 확인", "마감 시각을 HH:MM 형식으로 입력해 주세요. (예: 15:00)", parent=self)
+            return
+        start_date = ""
+        if self.start_date_var.get().strip():
+            start_date = normalize_date_input(self.start_date_var.get())
+            if start_date is None or start_date > due_date:
                 messagebox.showwarning(
                     "입력 확인", "시작일은 YYYY-MM-DD 형식이고 마감일보다 늦지 않아야 합니다.", parent=self
                 )
@@ -319,19 +368,25 @@ class TaskEditDialog(tk.Toplevel):
         description = self.desc_text.get("1.0", tk.END).strip()
 
         if self.task and self.task.id is not None:
-            old_status = self.task.status
-            if (due_date, due_time) != (self.task.due_date, self.task.due_time):
-                self.task.due_estimated = False  # 사용자가 직접 정한 기한은 확정값
-            self.task.title = title
-            self.task.start_date = start_date  # 마감일과 같으면 DB가 ''로 저장
-            self.task.due_date = due_date
-            self.task.due_time = due_time
-            self.task.label = label_key
-            self.task.priority = priority_val
-            self.task.recurrence = recur_key
-            self.task.source_ref = source_ref
-            self.task.description = description
-            self.task.is_new_scan = False
+            fresh = self.db.get_task(self.task.id)
+            if fresh is None:
+                messagebox.showwarning("저장 안 됨", "그 사이 업무가 삭제되어 저장할 수 없습니다.", parent=self)
+                if self.on_saved:
+                    self.on_saved()
+                self.destroy()
+                return
+            old_status = fresh.status
+            self.task = apply_edit(fresh, self.task, {
+                "title": title,
+                "start_date": start_date,  # 마감일과 같으면 DB가 ''로 저장
+                "due_date": due_date,
+                "due_time": due_time,
+                "label": label_key,
+                "priority": priority_val,
+                "recurrence": recur_key,
+                "source_ref": source_ref,
+                "description": description,
+            })
             self.db.update_task(self.task)
             if old_status != status_key:
                 self.db.set_task_status(self.task.id, status_key)

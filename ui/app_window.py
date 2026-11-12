@@ -6,7 +6,7 @@ import os
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import tkinter.font as tkfont
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from collectors.clipboard_collector import ClipboardCollector
 from collectors.ezq_collector import EzqMessageCollector, ezq_key_of
@@ -16,6 +16,7 @@ from core.config_store import save_config_values
 from core.database import DatabaseManager
 from core.models import RecurrenceType, TaskItem, TaskSource, TaskStatus
 from core.scheduler import AppScheduler
+from core.version import APP_VERSION
 from parsers.import_check import check_files
 from parsers.quick_entry import parse_quick_entry
 from parsers.rule_parser import RuleBasedExtractor
@@ -41,6 +42,43 @@ def short_date(date_str: str) -> str:
     return f"{d.month}.{d.day}({WEEKDAY_KO[d.weekday()]})"
 
 
+# 폴더 확인 한 번에 쓸 최대 시간(초). 넘으면 남은 파일은 다음 확인(15초 뒤)에 이어서 처리
+FOLDER_SCAN_BUDGET_SEC = 2.0
+# 일정 목록 '전체 보기'에 보여 줄 완료 업무: 마감이 이 날수 안인 것만 (오래 쓰면 수천 줄이 되어 느려짐)
+AGENDA_COMPLETED_DAYS = 90
+
+
+class ClickPairDetector:
+    """같은 대상을 빠르게 두 번 눌렀는지 판단.
+
+    캘린더 일정 칸은 첫 클릭에서 화면을 다시 그리며 새 위젯으로 바뀌므로,
+    Tk의 <Double-1>(두 클릭이 같은 위젯이어야 함)은 뜨지 않는다. 그래서 대상 키와 이벤트 시각으로 직접 판단한다.
+    """
+
+    def __init__(self, interval_ms: int = 500):
+        self.interval_ms = interval_ms
+        self._last: Optional[tuple] = None
+
+    def click(self, key, time_ms: int) -> bool:
+        last, self._last = self._last, (key, time_ms)
+        if last and last[0] == key and 0 <= time_ms - last[1] <= self.interval_ms:
+            self._last = None  # 세 번째 클릭이 또 '두 번 누름'이 되지 않게
+            return True
+        return False
+
+
+def month_to_show(year: int, month: int, date_str: str) -> tuple:
+    """date_str이 (year, month) 달력에 보이면 그대로, 아니면 그 날짜의 달."""
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return year, month
+    first = calendar.Calendar(firstweekday=6).monthdatescalendar(year, month)[0][0]  # _render_month_calendar와 같은 일요일 시작
+    if first <= d <= first + timedelta(days=41):  # 달력은 늘 6주(42칸)
+        return year, month
+    return d.year, d.month
+
+
 def postpone_targets(task: TaskItem, today: Optional[date] = None) -> List[tuple]:
     """우클릭 '미루기' 후보 [(메뉴 이름, 새 마감일)].
 
@@ -62,7 +100,7 @@ def postpone_targets(task: TaskItem, today: Optional[date] = None) -> List[tuple
 
 
 def bg_new_tasks_message(created: List[TaskItem]) -> str:
-    """자동 감지로 새로 등록한 업무 알림 문구. 배부 목록에서 받은 문서는 기한이 아직 추정이라고 덧붙임."""
+    """자동 감지로 새로 등록한 업무 알림 문구. 배부 목록에서 받은 문서는 열어야 판정된다고 덧붙임."""
     review = sum(1 for t in created if t.needs_review)
     parts = []
     if len(created) - review:
@@ -72,8 +110,21 @@ def bg_new_tasks_message(created: List[TaskItem]) -> str:
     text = f"신규 문서/메시지 자동 감지: {', '.join(parts)}"
     distributed = sum(1 for t in created if WORKMGMT_LIST_SOURCE_REF in (t.source_ref or ""))
     if distributed:
-        text += f" (배부받은 문서 {distributed}건: 문서를 열면 기한이 정해집니다)"
+        text += f" (배부받은 문서 {distributed}건: 문서를 열면 업무인지 판정하고 기한을 정합니다)"
     return text
+
+def list_doc_judged_message(confirmed: List[TaskItem], removed: List[TaskItem]) -> str:
+    """배부 문서를 열어 본문으로 판정한 결과 알림 문구."""
+    parts = []
+    registered = sum(1 for t in confirmed if not t.needs_review)
+    if registered:
+        parts.append(f"{registered}건 캘린더 등록")
+    if len(confirmed) - registered:
+        parts.append(f"{len(confirmed) - registered}건 확인 필요 유지")
+    if removed:
+        parts.append(f"{len(removed)}건 제외 (안내·통보 문서, [🧾 제외된 쪽지·문서]에서 되살릴 수 있음)")
+    return f"배부 문서 본문 판정: {', '.join(parts)}"
+
 
 class TodoCalendarApp(tk.Tk):
     def __init__(
@@ -109,7 +160,14 @@ class TodoCalendarApp(tk.Tk):
         self._active_reminder_popup: Optional[DeadlineReminderPopup] = None
         # 캘린더 칸(위젯 경로) → 날짜. 끌어다 놓을 때 마우스 아래 칸의 날짜를 찾는 데 씀
         self._cell_dates: Dict[str, str] = {}
+        # 달력 칸 부품 재사용 (다시 그릴 때 지우고 새로 만들지 않음)
+        self._cell_parts: List[Optional[dict]] = []
+        self._chip_data: Dict[str, tuple] = {}     # 칩 → (업무, 날짜)
+        self._widget_opts: Dict[str, dict] = {}    # 부품 → 마지막으로 보낸 설정
+        self._fit_cache: Dict[tuple, str] = {}     # (글자, 너비) → 잘라 낸 제목
+        self._width_cache: Dict[tuple, int] = {}
         self._drag: Optional[dict] = None
+        self._chip_clicks = ClickPairDetector()
         self._drop_cell: Optional[tuple] = None
         self._refresh_pending = False
         # 캘린더 칸 크기에 맞춰 업무 개수를 정함 (글자 높이 측정값, 마지막으로 그린 달력 크기, 다시 그리기 예약)
@@ -122,7 +180,8 @@ class TodoCalendarApp(tk.Tk):
         self._period_check_day: Optional[date] = None  # 반복 기간 만료 확인을 마지막으로 한 날 (하루 한 번)
 
         app_title = self.config_data.get("app_name", "사내 업무 캘린더 & 투두 매니저")
-        self.title(f"{app_title} v{self.config_data.get('version', '1.4.0')}")
+        # 버전은 프로그램 안의 값 (config.json은 예전 버전에서 가져온 파일일 수 있어 쓰지 않음)
+        self.title(f"{app_title} v{APP_VERSION}")
         self.geometry("1280x820")
         self.minsize(1060, 680)
         self.configure(bg="#F1F5F9")
@@ -132,7 +191,8 @@ class TodoCalendarApp(tk.Tk):
         self._bind_shortcuts()
 
         # 초기 폴더 자동 스캔 실행
-        initial_new = self.folder_collector.collect_and_register()
+        # (큰 폴더를 처음 가져오는 경우 창이 늦게 뜨지 않게 2초까지만, 나머지는 백그라운드 확인에서 이어서)
+        initial_new = self.folder_collector.collect_and_register(time_budget=FOLDER_SCAN_BUDGET_SEC)
         if self.ezq_collector:
             initial_new += self.ezq_collector.collect_and_register()
         if self.workmgmt_collector:
@@ -151,7 +211,8 @@ class TodoCalendarApp(tk.Tk):
             fast_callback=self._bg_fast_tick if (self.ezq_collector or self.workmgmt_collector) else None,
             fast_interval_sec=int(self.config_data.get("ezq_check_seconds", 3)),
         )
-        self.scheduler.start()
+        # mainloop가 돈 뒤에 시작: 그 전에 백그라운드 스레드가 self.after를 부르면 Tk 오류로 첫 알림·갱신이 빠짐
+        self.after(0, self.scheduler.start)
 
         # 출근 후 프로그램 실행 시 브리핑 팝업 자동 호출 (구상 2-3)
         if self.config_data.get("show_startup_briefing", True) or self.is_startup_mode:
@@ -678,6 +739,11 @@ class TodoCalendarApp(tk.Tk):
                 cell = tk.Frame(self.cal_grid_frame, bg="#FFFFFF", padx=4, pady=self._CELL_PADY)
                 cell.grid(row=r, column=c, sticky="nsew", padx=1, pady=1)
                 self.day_cells.append(cell)
+                # 칸은 계속 다시 쓰므로 클릭 연결은 여기서 한 번만 한다. 달력을 그릴 때마다 bind하면
+                # 예전 연결이 Tcl 쪽에 쌓여 오래 켜 둘수록 메모리가 는다. 날짜는 _cell_dates에서 찾음
+                cell.bind("<Button-1>", lambda _e, w=cell: self._cell_click(w, self._select_date))
+                cell.bind("<Double-1>", lambda _e, w=cell: self._cell_click(w, self.open_add_task_dialog))
+                cell.bind("<Button-3>", lambda e, w=cell: self._cell_click(w, lambda ds: self._on_date_right_click(e, ds)))
         # 창 크기가 바뀌면 칸에 들어가는 업무 개수가 달라지므로 달력만 다시 그림
         self.cal_grid_frame.bind("<Configure>", self._on_cal_resize, add="+")
 
@@ -1043,6 +1109,12 @@ class TodoCalendarApp(tk.Tk):
             self._last_layout_widths = None
             self._schedule_relayout()
 
+    def _cell_click(self, cell: tk.Frame, action) -> None:
+        """달력 칸에 지금 표시된 날짜로 동작을 실행 (칸의 날짜는 달을 옮길 때마다 바뀜)."""
+        d_str = self._cell_dates.get(str(cell))
+        if d_str:
+            action(d_str)
+
     def _render_month_calendar(self) -> None:
         self.month_title_lbl.config(text=f"{self.current_year}년 {self.current_month:02d}월")
         cal = calendar.Calendar(firstweekday=6)  # 일요일 시작 달력
@@ -1054,15 +1126,16 @@ class TodoCalendarApp(tk.Tk):
             ]
             month_days.append(next_week)
 
+        flat_dates = [d for week in month_days[:6] for d in week]
+        first_day, last_day = flat_dates[0], flat_dates[-1]
+
         f_args = self._get_filter_args()
-        all_tasks = self.db.query_tasks(**f_args)
+        # 보이는 6주에 걸치는 업무 + 기한경과·반복 미완료 업무만 읽음 (몇 년 치 업무를 매번 다 읽지 않게)
+        all_tasks = self.db.query_tasks(**f_args, visible_range=(first_day.isoformat(), last_day.isoformat()))
 
         tasks_by_date: Dict[str, List[TaskItem]] = {}
         overdue_tasks: List[TaskItem] = []
         today_str = date.today().strftime("%Y-%m-%d")
-
-        flat_dates = [d for week in month_days[:6] for d in week]
-        first_day, last_day = flat_dates[0], flat_dates[-1]
         # 기간 업무는 보이는 모든 날 칸에 (달이 바뀌는 기간도 겹치는 칸에 모두)
         for t in all_tasks:
             if not t.due_date:
@@ -1083,9 +1156,12 @@ class TodoCalendarApp(tk.Tk):
                 for d in span_dates(p, first_day, last_day):
                     previews.setdefault(d.strftime("%Y-%m-%d"), []).append(p)
 
+        m = self._chip_metrics_now()
+        overdue_count = len(overdue_tasks)
         for idx, cell in enumerate(self.day_cells):
-            for child in cell.winfo_children():
-                child.destroy()
+            # 칸 안의 부품(날짜 숫자, 업무 칩, '+ 외 N건')은 지우지 않고 다시 씀.
+            # 매번 지우고 새로 만들면 1년치 데이터에서 새로고침 한 번에 0.6초가 걸림
+            parts = self._cell_parts_for(idx, cell)
 
             cell_date = flat_dates[idx]
             d_str = cell_date.strftime("%Y-%m-%d")
@@ -1099,21 +1175,16 @@ class TodoCalendarApp(tk.Tk):
             if is_selected:
                 bg_color = "#DBEAFE"
 
-            cell.config(
+            self._set_opts(
+                cell,
                 bg=bg_color,
                 highlightbackground="#2563EB" if is_selected else "#E2E8F0",
                 highlightthickness=2 if is_selected else 1,
             )
             self._cell_dates[str(cell)] = d_str
-            cell.bind("<Button-1>", lambda _e, ds=d_str: self._select_date(ds))
-            cell.bind("<Double-1>", lambda _e, ds=d_str: self.open_add_task_dialog(ds))
-            cell.bind("<Button-3>", lambda e, ds=d_str: self._on_date_right_click(e, ds))
 
             # 상단 날짜 숫자 및 배지 줄
-            top_row = tk.Frame(cell, bg=bg_color)
-            top_row.pack(fill=tk.X)
-            top_row.bind("<Button-1>", lambda _e, ds=d_str: self._select_date(ds))
-            top_row.bind("<Button-3>", lambda e, ds=d_str: self._on_date_right_click(e, ds))
+            self._set_opts(parts["top"], bg=bg_color)
 
             col_idx = idx % 7
             if not is_current_month:
@@ -1125,122 +1196,183 @@ class TodoCalendarApp(tk.Tk):
             else:
                 num_fg = "#1E293B"
 
-            day_txt = f"{cell_date.day} (오늘)" if is_today else f"{cell_date.day}"
-            day_lbl = tk.Label(
-                top_row,
-                text=day_txt,
+            self._set_opts(
+                parts["day"],
+                text=f"{cell_date.day} (오늘)" if is_today else f"{cell_date.day}",
                 font=("Malgun Gothic", 9, "bold" if (is_today or is_selected) else "normal"),
                 bg=bg_color,
                 fg=num_fg,
-                pady=0,
-                bd=0,
             )
-            day_lbl.pack(side=tk.LEFT)
-            day_lbl.bind("<Button-1>", lambda _e, ds=d_str: self._select_date(ds))
-            day_lbl.bind("<Button-3>", lambda e, ds=d_str: self._on_date_right_click(e, ds))
 
             # 오늘 칸에는 기한 경과(자동 이월) 건수 배지 표시
-            if is_today and overdue_tasks:
-                ov_badge = tk.Label(
-                    top_row,
-                    text=f"🚨이월 {len(overdue_tasks)}",
-                    font=("Malgun Gothic", 7, "bold"),
-                    bg="#DC2626",
-                    fg="white",
-                    padx=4,
-                    pady=0,
-                    bd=0,
-                )
-                ov_badge.pack(side=tk.RIGHT)
-                ov_badge.bind("<Button-1>", lambda _e, ds=d_str: self._select_date(ds))
-                ov_badge.bind("<Button-3>", lambda e, ds=d_str: self._on_date_right_click(e, ds))
+            if is_today and overdue_count:
+                if parts["ov"] is None:
+                    parts["ov"] = tk.Label(
+                        parts["top"], font=("Malgun Gothic", 7, "bold"), bg="#DC2626", fg="white", padx=4, pady=0, bd=0
+                    )
+                    self._bind_date_clicks(parts["ov"], cell)
+                self._set_opts(parts["ov"], text=f"🚨이월 {overdue_count}")
+                if not parts["ov_on"]:
+                    parts["ov"].pack(side=tk.RIGHT)
+                    parts["ov_on"] = True
+            elif parts["ov_on"]:
+                parts["ov"].pack_forget()
+                parts["ov_on"] = False
 
             day_items = list(tasks_by_date.get(d_str, [])) + previews.get(d_str, [])
             # 칸 높이에 들어가는 만큼 보이고 나머지는 '+ 외 N건' (글자 크기는 그대로)
-            m = self._chip_metrics_now()
-            hl = 2 if is_selected else 1
+            # 테두리는 선택하면 1px → 2px. 선택 여부와 상관없이 2px로 계산해야, 칸에 딱 맞게 들어가 있던
+            # 맨 아래 업무가 그 칸을 누르는 순간 '+ 외 N건'으로 숨지 않음
+            hl = 2
             avail_h = cell.winfo_height() - 2 * (hl + self._CELL_PADY) - m["header"] if cell.winfo_height() > 1 else 0
             max_chips, hidden = chips_that_fit(len(day_items), avail_h, m["slot"], m["more"])
             text_w = cell.winfo_width() - 2 * (hl + 4) - 2 * 3 if cell.winfo_width() > 1 else 0
-            for t in day_items[:max_chips]:
+            shown = day_items[:max_chips]
+
+            # '+ 외 N건'은 항상 업무 칩 아래에 와야 하므로, 칩을 더 꺼내기 전에 잠시 뺌
+            if parts["more_on"] and (len(shown) > parts["shown"] or not hidden):
+                parts["more"].pack_forget()
+                parts["more_on"] = False
+
+            chips = parts["chips"]
+            for i, t in enumerate(shown):
+                if i == len(chips):
+                    chips.append(self._new_chip(cell))
+                chip = chips[i]
                 # 기간 업무의 이어지는 칸 (시작 칸과 각 주 첫 칸은 제목 그대로)
                 cont = t.is_period and d_str != t.start_date and col_idx != 0
-                if t.is_preview:
-                    self._add_preview_chip(cell, t, d_str, text_w, m, cont)
-                    continue
-                lbl_cfg = self.labels_config.get(t.label, {})
-                chip_bg = "#E2E8F0" if t.is_completed else lbl_cfg.get("bg_color", "#E0F2FE")
-                chip_fg = "#64748B" if t.is_completed else lbl_cfg.get("color", "#0369A1")
-                if t.is_overdue():
-                    chip_bg = "#FEE2E2"
-                    chip_fg = "#B91C1C"
-
-                prefix = "✓ " if t.is_completed else ("🚨 " if t.is_overdue() else "• ")
-                if cont:
-                    prefix = "▸ "
-                if text_w > 0:
-                    chip_text = fit_title(f"{prefix}{t.title}", text_w, m["chip_font"].measure)
-                else:
-                    chip_text = prefix + (t.title if len(t.title) <= 14 else t.title[:13] + "…")
-                # 테두리·위아래 여백 없이 글자 높이만 차지하게 해 한 칸에 더 많이 들어가게 함
-                chip = tk.Label(
-                    cell,
-                    text=chip_text,
-                    font=m["chip_font"],
-                    bg=chip_bg,
-                    fg=chip_fg,
-                    anchor="w",
-                    padx=3,
-                    pady=0,
-                    bd=0,
-                    highlightthickness=0,
-                    cursor="hand2",
-                )
-                chip.pack(fill=tk.X, pady=(0, self._CHIP_GAP))
-                # 누르고 끌면 다른 날짜로 옮기기, 그냥 떼면 선택 (선택 화면 갱신은 뗄 때 해야 끌기가 끊기지 않음)
-                chip.bind("<ButtonPress-1>", lambda e, ds=d_str, task_obj=t: self._chip_press(e, task_obj, ds))
-                chip.bind("<B1-Motion>", self._chip_motion)
-                chip.bind("<ButtonRelease-1>", self._chip_release)
-                chip.bind("<Double-1>", lambda _e, task_obj=t: self.open_edit_task_dialog(task_obj))
-                chip.bind("<Button-3>", lambda e, ds=d_str, task_obj=t: self._on_task_right_click(e, task_obj, ds))
+                text, chip_bg, chip_fg = self._chip_look(t, cont, text_w, m)
+                self._set_opts(chip, text=text, bg=chip_bg, fg=chip_fg)
+                self._chip_data[str(chip)] = (t, d_str)
+                if i >= parts["shown"]:
+                    chip.pack(fill=tk.X, pady=(0, self._CHIP_GAP))
+            for i in range(len(shown), parts["shown"]):
+                chips[i].pack_forget()
+                self._chip_data.pop(str(chips[i]), None)
+            parts["shown"] = len(shown)
 
             if hidden:
                 more_text = f"+ 외 {hidden}건 더보기"
-                if 0 < text_w < m["more_font"].measure(more_text):
+                if 0 < text_w < self._text_width(m["more_font"], more_text):
                     more_text = f"+{hidden}건"
-                more_lbl = tk.Label(
-                    cell,
-                    text=more_text,
-                    font=m["more_font"],
-                    bg=bg_color,
-                    fg="#475569",
-                    anchor="e",
-                    pady=0,
-                    bd=0,
-                    highlightthickness=0,
-                )
-                more_lbl.pack(fill=tk.X)
-                more_lbl.bind("<Button-1>", lambda _e, ds=d_str: self._select_date(ds))
-                more_lbl.bind("<Button-3>", lambda e, ds=d_str: self._on_date_right_click(e, ds))
+                if parts["more"] is None:
+                    parts["more"] = tk.Label(
+                        cell, font=m["more_font"], fg="#475569", anchor="e", pady=0, bd=0, highlightthickness=0
+                    )
+                    self._bind_date_clicks(parts["more"], cell)
+                self._set_opts(parts["more"], text=more_text, bg=bg_color)
+                if not parts["more_on"]:
+                    parts["more"].pack(fill=tk.X)
+                    parts["more_on"] = True
 
-    def _add_preview_chip(
-        self, cell: tk.Frame, t: TaskItem, d_str: str, text_w: int, m: dict, cont: bool = False
-    ) -> None:
-        """반복 업무의 다음 날짜 미리보기 칸: 라벨 바탕색에 흐린 글자, 끌어 옮기기·업무 메뉴 없음.
-        두 번 누르면 반복 업무(지금 진행할 회차)를 엶. cont: 기간 미리보기의 이어지는 칸."""
-        lbl_cfg = self.labels_config.get(t.label, {})
-        text = f"▸ {t.title}" if cont else f"↻ {t.title}"
-        chip_text = fit_title(text, text_w, m["chip_font"].measure) if text_w > 0 else (
-            text if len(text) <= 15 else text[:14] + "…"
-        )
+    def _set_opts(self, widget: tk.Widget, **opts) -> None:
+        """바뀐 설정만 Tk에 보냄 (다시 그릴 때 대부분의 칸은 그대로라서 Tk 호출이 크게 줆)."""
+        key = str(widget)
+        old = self._widget_opts.get(key)
+        if old is None:
+            widget.config(**opts)
+            self._widget_opts[key] = opts
+            return
+        changed = {k: v for k, v in opts.items() if old.get(k) != v}
+        if changed:
+            widget.config(**changed)
+            old.update(changed)
+
+    def _bind_date_clicks(self, widget: tk.Widget, cell: tk.Frame) -> None:
+        """칸 안의 부품을 눌러도 그 칸에 지금 표시된 날짜가 선택되게 (한 번만 연결)."""
+        widget.bind("<Button-1>", lambda _e, w=cell: self._cell_click(w, self._select_date))
+        widget.bind("<Button-3>", lambda e, w=cell: self._cell_click(w, lambda ds: self._on_date_right_click(e, ds)))
+
+    def _cell_parts_for(self, idx: int, cell: tk.Frame) -> dict:
+        while len(self._cell_parts) <= idx:
+            self._cell_parts.append(None)
+        parts = self._cell_parts[idx]
+        if parts is None:
+            top = tk.Frame(cell)
+            top.pack(fill=tk.X)
+            day = tk.Label(top, pady=0, bd=0)
+            day.pack(side=tk.LEFT)
+            self._bind_date_clicks(top, cell)
+            self._bind_date_clicks(day, cell)
+            parts = {"top": top, "day": day, "ov": None, "ov_on": False, "chips": [], "shown": 0,
+                     "more": None, "more_on": False}
+            self._cell_parts[idx] = parts
+        return parts
+
+    def _new_chip(self, cell: tk.Frame) -> tk.Label:
+        """업무 칩 하나. 어떤 업무를 보여 주는지는 _chip_data에 두고, 누를 때 찾아 씀."""
+        # 테두리·위아래 여백 없이 글자 높이만 차지하게 해 한 칸에 더 많이 들어가게 함
         chip = tk.Label(
-            cell, text=chip_text, font=m["chip_font"], bg=lbl_cfg.get("bg_color", "#F1F5F9"), fg="#94A3B8",
-            anchor="w", padx=3, pady=0, bd=0, highlightthickness=0, cursor="hand2",
+            cell, font=self._chip_metrics_now()["chip_font"], anchor="w", padx=3, pady=0, bd=0,
+            highlightthickness=0, cursor="hand2",
         )
-        chip.pack(fill=tk.X, pady=(0, self._CHIP_GAP))
-        chip.bind("<Button-1>", lambda _e, ds=d_str: self._select_date(ds))
-        chip.bind("<Double-1>", lambda _e, tid=t.id: self._open_task_by_id(tid))
-        chip.bind("<Button-3>", lambda e, ds=d_str: self._on_date_right_click(e, ds))
+        # 누르고 끌면 다른 날짜로 옮기기, 그냥 떼면 선택 (선택 화면 갱신은 뗄 때 해야 끌기가 끊기지 않음)
+        # 두 번 누르기는 _chip_press에서 판단 (<Double-1>에 기대지 않음)
+        chip.bind("<ButtonPress-1>", lambda e, w=chip: self._chip_event(w, e, menu=False))
+        chip.bind("<B1-Motion>", self._chip_motion)
+        chip.bind("<ButtonRelease-1>", self._chip_release)
+        chip.bind("<Button-3>", lambda e, w=chip: self._chip_event(w, e, menu=True))
+        return chip
+
+    def _chip_event(self, chip: tk.Label, event, menu: bool) -> None:
+        data = self._chip_data.get(str(chip))
+        if not data:
+            return
+        task, d_str = data
+        if task.is_preview:
+            # 반복 업무의 다음 날짜 미리보기: 끌어 옮기기·업무 메뉴 없음. 두 번 누르면 반복 업무를 엶
+            if menu:
+                self._on_date_right_click(event, d_str)
+            else:
+                self._preview_chip_click(event, d_str, task.id)
+        elif menu:
+            self._on_task_right_click(event, task, d_str)
+        else:
+            self._chip_press(event, task, d_str)
+
+    def _chip_look(self, t: TaskItem, cont: bool, text_w: int, m: dict):
+        """업무 칩의 (글자, 바탕색, 글자색). cont: 기간 업무의 이어지는 칸."""
+        lbl_cfg = self.labels_config.get(t.label, {})
+        if t.is_preview:
+            # 미리보기는 라벨 바탕색에 흐린 글자
+            text = f"▸ {t.title}" if cont else f"↻ {t.title}"
+            short = text if len(text) <= 15 else text[:14] + "…"
+            chip_bg, chip_fg = lbl_cfg.get("bg_color", "#F1F5F9"), "#94A3B8"
+        else:
+            overdue = t.is_overdue()
+            chip_bg = "#E2E8F0" if t.is_completed else lbl_cfg.get("bg_color", "#E0F2FE")
+            chip_fg = "#64748B" if t.is_completed else lbl_cfg.get("color", "#0369A1")
+            if overdue:
+                chip_bg, chip_fg = "#FEE2E2", "#B91C1C"
+            prefix = "✓ " if t.is_completed else ("🚨 " if overdue else "• ")
+            if cont:
+                prefix = "▸ "
+            text = f"{prefix}{t.title}"
+            short = prefix + (t.title if len(t.title) <= 14 else t.title[:13] + "…")
+        if text_w <= 0:
+            return short, chip_bg, chip_fg
+        key = (text, text_w)
+        fitted = self._fit_cache.get(key)
+        if fitted is None:
+            if len(self._fit_cache) > 4000:
+                self._fit_cache.clear()
+            fitted = self._fit_cache[key] = fit_title(text, text_w, m["chip_font"].measure)
+        return fitted, chip_bg, chip_fg
+
+    def _text_width(self, font, text: str) -> int:
+        key = (str(font), text)
+        width = self._width_cache.get(key)
+        if width is None:
+            if len(self._width_cache) > 4000:
+                self._width_cache.clear()
+            width = self._width_cache[key] = font.measure(text)
+        return width
+
+    def _preview_chip_click(self, event, date_str: str, task_id: Optional[int]) -> None:
+        if self._chip_clicks.click(("preview", task_id), event.time):
+            self._open_task_by_id(task_id)
+        else:
+            self._select_date(date_str)
 
     def _open_task_by_id(self, task_id: Optional[int]) -> None:
         task = self.db.get_task(task_id) if task_id is not None else None
@@ -1292,6 +1424,9 @@ class TodoCalendarApp(tk.Tk):
         self._agenda_task_map.clear()
 
         f_args = self._get_filter_args()
+        # '전체 보기'에서 검색어가 없으면 마감이 오래 지난 완료 업무는 뺌 (검색하거나 '완료'를 고르면 모두 나옴)
+        if f_args["status_filter"] == "ALL" and not f_args["keyword"]:
+            f_args["hide_completed_before"] = (date.today() - timedelta(days=AGENDA_COMPLETED_DAYS)).isoformat()
         tasks = self.db.query_tasks(**f_args)
         today_str = date.today().strftime("%Y-%m-%d")
 
@@ -1519,13 +1654,22 @@ class TodoCalendarApp(tk.Tk):
             on_saved=self.refresh_all,
         )
 
-    def open_edit_task_dialog(self, task: TaskItem) -> None:
+    def open_edit_task_dialog(
+        self, task: TaskItem, parent: Optional[tk.Misc] = None, after_save: Optional[Callable[[], None]] = None
+    ) -> None:
+        """parent: 편집 창을 띄울 창 (출근 브리핑처럼 항상 위 창에서 열면 그 위에 뜨게).
+        after_save: 저장·삭제 뒤 메인 화면과 함께 갱신할 것 (브리핑 목록 등)."""
+        def saved() -> None:
+            self.refresh_all()
+            if after_save:
+                after_save()
+
         TaskEditDialog(
-            parent=self,
+            parent=parent or self,
             db=self.db,
             labels_config=self.labels_config,
             task=task,
-            on_saved=self.refresh_all,
+            on_saved=saved,
         )
 
     def open_edit_selected_task(self) -> None:
@@ -1737,6 +1881,8 @@ class TodoCalendarApp(tk.Tk):
             return
         self.selected_task = updated
         self.selected_date_str = new_date
+        # 옮긴 날짜가 지금 달력(6주) 밖이면 그 달로 넘김 ('다음 주 월요일로'가 다음 달로 넘어가면 안 보이던 문제)
+        self.current_year, self.current_month = month_to_show(self.current_year, self.current_month, new_date)
         self.refresh_all()
         self._flash_quick(
             f"📅 기한 변경: {updated.title}  {short_date(old_date)} → {short_date(new_date)}", "#B45309"
@@ -1745,6 +1891,10 @@ class TodoCalendarApp(tk.Tk):
     # ── 일정 칩 끌어다 놓기 (월간 캘린더) ─────────────────────────
 
     def _chip_press(self, event, task: TaskItem, date_str: str) -> None:
+        if self._chip_clicks.click(("task", task.id), event.time):
+            self._drag = None
+            self.open_edit_task_dialog(task)
+            return
         self._drag = {"task": task, "from": date_str, "x": event.x_root, "y": event.y_root, "active": False}
 
     def _chip_motion(self, event) -> None:
@@ -1995,13 +2145,27 @@ class TodoCalendarApp(tk.Tk):
             )
 
     def _bg_scan_tick(self) -> int:
-        created = self.folder_collector.collect_and_register(force=False)
+        created = self.folder_collector.collect_and_register(force=False, time_budget=FOLDER_SCAN_BUDGET_SEC)
         if created:
             self.after(0, self._on_bg_new_tasks_found, created)
-        # 날짜가 바뀌면 (켜 둔 채 자정을 넘김) 끝난 반복 기간의 다음 기간을 만듦
-        if self._period_check_day != date.today() and self._activate_expired_periods():
-            self.after(0, self.refresh_all)
+        # 날짜가 바뀌면 (켜 둔 채 자정을 넘김) 끝난 반복 기간의 다음 기간을 만들고, 화면의 '오늘'을 새 날로 옮김
+        # (예전엔 다음 기간이 생길 때만 다시 그려서, 어제를 오늘로 표시하고 새로 기한이 지난 업무도 빨갛게 안 바뀌었음)
+        old_day = self._period_check_day
+        if old_day != date.today():
+            self._activate_expired_periods()
+            if old_day is not None:
+                self.after(0, self._on_new_day, old_day)
         return len(created)
+
+    def _on_new_day(self, old_day: date) -> None:
+        """자정을 넘긴 뒤 한 번: 어제(그때의 오늘)를 보고 있었으면 새 오늘로 옮기고 화면을 다시 그림."""
+        today = date.today()
+        if self.selected_date_str == old_day.isoformat():
+            self.selected_date_str = today.isoformat()
+            self.selected_task = None
+            if (self.current_year, self.current_month) == (old_day.year, old_day.month):
+                self.current_year, self.current_month = today.year, today.month
+        self.refresh_all()
 
     def _activate_expired_periods(self) -> List[int]:
         """끝날이 지난 반복 기간 업무의 다음 기간 활성화 (하루 한 번). 실패해도 앱은 계속."""
@@ -2020,11 +2184,22 @@ class TodoCalendarApp(tk.Tk):
         if self.workmgmt_collector:
             created += self.workmgmt_collector.collect_and_register()
             merged = list(self.workmgmt_collector.merged)
+            judged = (list(self.workmgmt_collector.confirmed), list(self.workmgmt_collector.removed))
+        else:
+            judged = ([], [])
         if created:
             self.after(0, self._on_bg_new_tasks_found, created)
+        elif judged[0] or judged[1]:
+            self.after(0, self._on_bg_list_doc_judged, *judged)
         elif merged:
             self.after(0, self._on_bg_merged, merged)
         return len(created)
+
+    def _on_bg_list_doc_judged(self, confirmed: List[TaskItem], removed: List[TaskItem]) -> None:
+        """배부 문서를 열어 본문으로 판정한 결과를 화면에 반영."""
+        self.refresh_all()
+        now_hm = datetime.now().strftime("%H:%M:%S")
+        self._set_status_text(f"[{now_hm}] {list_doc_judged_message(confirmed, removed)}", fg="#4ADE80")
 
     def _on_bg_merged(self, merged: List[TaskItem]) -> None:
         self.refresh_all()

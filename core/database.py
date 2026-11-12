@@ -69,6 +69,42 @@ def add_months(src_date: date, months: int = 1) -> date:
     return date(year, month, day)
 
 
+def month_anchor_day(due: date, recur_day: int) -> int:
+    """매월 반복의 기준 날짜. 저장된 원래 날짜(recur_day)가 지금 마감일과 맞을 때만 씀
+    (31일 업무의 2월 회차 2/28 → 31). 사용자가 마감일을 다른 날로 바꿨으면 바꾼 날짜를 따름."""
+    if recur_day and min(recur_day, calendar.monthrange(due.year, due.month)[1]) == due.day:
+        return recur_day
+    return due.day
+
+
+def add_months_anchored(due: date, months: int, anchor_day: int) -> date:
+    """due에서 months달 뒤, 날짜는 anchor_day (그 달에 없으면 말일)."""
+    base = add_months(date(due.year, due.month, 1), months)
+    return date(base.year, base.month, min(anchor_day, calendar.monthrange(base.year, base.month)[1]))
+
+
+def next_occurrence(due: date, recurrence: str, today: date, recur_day: int = 0) -> Optional[date]:
+    """반복 업무를 완료했을 때 다음 회차 날짜. 원래 주기(요일·날짜)를 유지하며 한 주기 이상 밀고,
+    늦게 완료해 이미 지난 회차는 건너뛰어 오늘 이후의 첫 회차로 함.
+    (예: 일요일 마감 매주 업무를 화요일에 완료 → 다음 일요일. 예전엔 다음 주 화요일로 요일이 바뀜)"""
+    if recurrence == RecurrenceType.DAILY:
+        step = 1
+    elif recurrence == RecurrenceType.WEEKLY:
+        step = 7
+    elif recurrence == RecurrenceType.MONTHLY:
+        anchor = month_anchor_day(due, recur_day)
+        k = 1
+        nxt = add_months_anchored(due, k, anchor)
+        while nxt < today:
+            k += 1
+            nxt = add_months_anchored(due, k, anchor)
+        return nxt
+    else:
+        return None
+    k = max(1, -(-(today - due).days // step))  # today 이상이 되는 첫 주기 (올림)
+    return due + timedelta(days=step * k)
+
+
 def next_period(start: date, end: date, recurrence: str, today: date) -> Tuple[date, date]:
     """반복 기간 업무의 다음 기간. 시작·끝을 한 주기씩 함께 밀고, 끝이 오늘 이후가 될 때까지 반복.
 
@@ -164,6 +200,9 @@ class DatabaseManager:
                 if "start_date" not in existing_cols:
                     # 기간 업무의 시작일 (due_date는 기간의 끝). 빈 값이면 일반 마감 업무
                     cur.execute("ALTER TABLE tasks ADD COLUMN start_date TEXT DEFAULT ''")
+                if "recur_day" not in existing_cols:
+                    # 매월 반복의 원래 날짜 (말일 보정이 쌓여 31일 → 28일로 굳는 것 방지)
+                    cur.execute("ALTER TABLE tasks ADD COLUMN recur_day INTEGER DEFAULT 0")
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_tasks_external_key ON tasks(external_key)"
                 )
@@ -259,6 +298,7 @@ class DatabaseManager:
             needs_review=bool(row["needs_review"]),
             ezq_key=row["ezq_key"] or "",
             start_date=row["start_date"] or "",
+            recur_day=int(row["recur_day"] or 0),
         )
 
     @staticmethod
@@ -305,8 +345,8 @@ class DatabaseManager:
                         due_date, due_time, status, label, priority,
                         recurrence, is_new_scan, notified_at, snooze_until,
                         created_at, updated_at, completed_at,
-                        external_key, due_estimated, needs_review, ezq_key, start_date
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        external_key, due_estimated, needs_review, ezq_key, start_date, recur_day
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task.title.strip(),
@@ -331,6 +371,7 @@ class DatabaseManager:
                         1 if task.needs_review else 0,
                         task.ezq_key,
                         self._normalized_start(task),
+                        int(task.recur_day or 0),
                     ),
                 )
                 conn.commit()
@@ -383,8 +424,13 @@ class DatabaseManager:
             finally:
                 conn.close()
 
-    def find_confirmed_portal_task_by_title(self, title: str, threshold: float = 0.85) -> Optional[TaskItem]:
+    def find_confirmed_portal_task_by_title(
+        self, title: str, threshold: float = 0.85, or_source_ref_contains: str = ""
+    ) -> Optional[TaskItem]:
         """기한이 확정된(공문 본문·PDF로 받은) 최근 30일 미완료 사내포털 업무를 제목으로 찾음.
+
+        or_source_ref_contains: 출처에 이 글자가 들어 있는 업무는 기한이 추정이어도 찾음
+        (문서 창에서 먼저 받은 기한 없는 문서 → 뒤에 배부 목록에 다른 번호로 나와도 한 업무로).
 
         배부 목록 번호가 접수번호라 키로 못 찾을 때. 숫자만 다른 제목은 다른 문서 (find_estimated_task_by_title과 같은 규칙).
         """
@@ -396,8 +442,9 @@ class DatabaseManager:
             conn = self._get_conn()
             try:
                 rows = conn.execute(
-                    "SELECT * FROM tasks WHERE due_estimated = 0 AND source = ? AND status != ? AND created_at >= ?",
-                    (TaskSource.PORTAL, TaskStatus.COMPLETED, since),
+                    "SELECT * FROM tasks WHERE (due_estimated = 0 OR (? != '' AND source_ref LIKE ?))"
+                    " AND source = ? AND status != ? AND created_at >= ?",
+                    (or_source_ref_contains, "%" + or_source_ref_contains + "%", TaskSource.PORTAL, TaskStatus.COMPLETED, since),
                 ).fetchall()
             finally:
                 conn.close()
@@ -445,7 +492,14 @@ class DatabaseManager:
 
         반환 상태: created(신규) / updated(기한 등 갱신) / completed(원본에서 완료 처리됨)
                   / unchanged(이미 동일) / skipped(완료 문서라 등록 안 함) / duplicate(내용 중복)
+
+        찾기~넣기를 잠금 하나로 묶음: 화면의 클립보드 스캔과 백그라운드 수집이 같은 문서를 동시에 넣어 두 건이 되던 경쟁 방지
+        (_lock은 RLock이라 안에서 부르는 메서드가 다시 잠가도 됨)
         """
+        with self._lock:
+            return self._upsert_scanned_task(task)
+
+    def _upsert_scanned_task(self, task: TaskItem) -> Tuple[Optional[int], str]:
         existing = self.find_task_by_keys([task.external_key] + list(task.match_keys))
         if existing is None and task.source == TaskSource.PORTAL and task.match_keys and not task.due_estimated:
             existing = self.find_estimated_task_by_title(task.title)
@@ -520,7 +574,8 @@ class DatabaseManager:
                         due_estimated = ?,
                         needs_review = ?,
                         ezq_key = ?,
-                        start_date = ?
+                        start_date = ?,
+                        recur_day = ?
                     WHERE id = ?
                     """,
                     (
@@ -544,6 +599,7 @@ class DatabaseManager:
                         1 if task.needs_review else 0,
                         task.ezq_key,
                         self._normalized_start(task),
+                        int(task.recur_day or 0),
                         task.id,
                     ),
                 )
@@ -585,16 +641,11 @@ class DatabaseManager:
         ):
             try:
                 base_date = datetime.strptime(task.due_date, "%Y-%m-%d").date()
-                if base_date < date.today():
-                    base_date = date.today()
-                if task.recurrence == RecurrenceType.DAILY:
-                    next_date = base_date + timedelta(days=1)
-                elif task.recurrence == RecurrenceType.WEEKLY:
-                    next_date = base_date + timedelta(days=7)
-                elif task.recurrence == RecurrenceType.MONTHLY:
-                    next_date = add_months(base_date, 1)
-                else:
-                    next_date = None
+                next_date = next_occurrence(base_date, task.recurrence, date.today(), task.recur_day)
+                anchor = (
+                    month_anchor_day(base_date, task.recur_day)
+                    if task.recurrence == RecurrenceType.MONTHLY else 0
+                )
 
                 if next_date:
                     next_due_str = next_date.strftime("%Y-%m-%d")
@@ -614,6 +665,7 @@ class DatabaseManager:
                         priority=task.priority,
                         recurrence=task.recurrence,
                         is_new_scan=False,
+                        recur_day=anchor,
                     )
                     next_task_id, _ = self.add_task(next_item, skip_if_duplicate=True)
             except ValueError:
@@ -798,15 +850,23 @@ class DatabaseManager:
             finally:
                 conn.close()
 
-    def mark_notified(self, task_id: int) -> None:
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    def mark_notified(self, task_id: int, now: Optional[datetime] = None) -> None:
+        """알림을 띄운 시각을 기록한다.
+
+        Snooze 시각이 이미 지난 업무는 이번 알림으로 Snooze가 끝난 것이므로 snooze_until을 비운다.
+        비우지 않으면 get_due_tasks_for_reminder가 '하루 한 번' 확인을 건너뛰어 매 주기마다 다시 뜬다.
+        """
+        now_str = (now or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
         with self._lock:
             conn = self._get_conn()
             try:
                 cur = conn.cursor()
                 cur.execute(
-                    "UPDATE tasks SET notified_at = ? WHERE id = ?",
-                    (now_str, task_id),
+                    "UPDATE tasks SET notified_at = ?, "
+                    "snooze_until = CASE WHEN snooze_until IS NOT NULL AND snooze_until <= ? "
+                    "THEN NULL ELSE snooze_until END "
+                    "WHERE id = ?",
+                    (now_str, now_str, task_id),
                 )
                 conn.commit()
             finally:
@@ -903,8 +963,17 @@ class DatabaseManager:
         year_month: Optional[str] = None,  # YYYY-MM
         needs_review: Optional[bool] = False,
         include_period_span: bool = False,
+        visible_range: Optional[Tuple[str, str]] = None,
+        hide_completed_before: Optional[str] = None,
     ) -> List[TaskItem]:
         """다중 조건 검색 및 미완료 업무 자동 이월(Rollover) 지원 조회.
+
+        visible_range: (첫날, 끝날) 월간 달력에 보이는 범위. 그 범위에 걸치는 업무와, 범위와 상관없이
+        미완료 기한경과 업무(오늘 칸 이월 표시)·미완료 반복 업무(앞으로의 날짜 미리보기)만 읽음.
+        1년 넘게 쓰면 업무가 수천 건이라 갱신마다 전부 읽으면 화면이 1초 가까이 멈췄음.
+
+        hide_completed_before: 이 날짜(YYYY-MM-DD)보다 마감이 이른 완료 업무는 뺌 (일정 목록이 몇 년 치
+        완료 업무로 수천~수만 줄이 되지 않게). 미완료 업무는 날짜와 상관없이 모두 나옴.
 
         include_period_span: True면 target_date가 시작~끝 사이인 기간 업무도 그날 업무로 (오른쪽 날짜 목록용).
 
@@ -962,6 +1031,19 @@ class DatabaseManager:
         if year_month:
             clauses.append("due_date LIKE ?")
             params.append(f"{year_month}-%")
+
+        if hide_completed_before:
+            clauses.append("(status != ? OR due_date >= ?)")
+            params.extend([TaskStatus.COMPLETED, hide_completed_before])
+
+        if visible_range:
+            lo, hi = visible_range
+            clauses.append(
+                "((due_date >= ? AND due_date <= ?)"
+                " OR (start_date != '' AND start_date <= ? AND due_date >= ?)"
+                " OR (status != ? AND due_date != '' AND (due_date < ? OR recurrence != ?)))"
+            )
+            params.extend([lo, hi, hi, lo, TaskStatus.COMPLETED, today_str, RecurrenceType.NONE])
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = f"""
@@ -1435,6 +1517,18 @@ class DatabaseManager:
                     "INSERT OR IGNORE INTO ezq_messages (msg_key, first_seen, verdict, score, reasons, body)"
                     " VALUES (?, ?, ?, ?, ?, ?)",
                     (msg_key, first_seen, verdict, score, "\n".join(reasons), body),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def forget_ezq_message(self, msg_key: str) -> None:
+        """처리 중 오류가 난 쪽지의 판정 기록을 지워 다음 확인 때 다시 처리되게 함 (사용자 표시가 있으면 그대로 둠)."""
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                conn.execute(
+                    "DELETE FROM ezq_messages WHERE msg_key = ? AND COALESCE(user_label, '') = ''", (msg_key,)
                 )
                 conn.commit()
             finally:

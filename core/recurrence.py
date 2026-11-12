@@ -8,15 +8,18 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
 
-from core.database import add_months, next_period  # noqa: F401  next_period: 반복 모듈에서도 쓰게 다시 내보냄
-from core.models import RecurrenceType, TaskItem
+from core.database import add_months, add_months_anchored, month_anchor_day, next_period  # noqa: F401  next_period: 반복 모듈에서도 쓰게 다시 내보냄
+from core.models import RecurrenceType, TaskItem, parse_ymd
 
 ROUTINE_LABEL = "ROUTINE"
 DEFAULT_LABEL = "MANUAL"
 
 
-def occurrence_dates(due: date, recurrence: str, start: date, end: date, today: date) -> List[date]:
-    """due 다음 주기부터 [start, end] 안의 날짜들. 오늘보다 이른 날짜는 뺌 (지난 미리보기는 의미 없음)."""
+def occurrence_dates(
+    due: date, recurrence: str, start: date, end: date, today: date, recur_day: int = 0
+) -> List[date]:
+    """due 다음 주기부터 [start, end] 안의 날짜들. 오늘보다 이른 날짜는 뺌 (지난 미리보기는 의미 없음).
+    매월 반복은 원래 날짜(recur_day)를 기준으로 함 (완료 때 만드는 다음 회차와 같게)."""
     first = max(start, today)
     if first > end:
         return []
@@ -29,13 +32,14 @@ def occurrence_dates(due: date, recurrence: str, start: date, end: date, today: 
             out.append(d)
             d += timedelta(days=step)
     elif recurrence == RecurrenceType.MONTHLY:
+        anchor = month_anchor_day(due, recur_day)
         k = max(1, (first.year - due.year) * 12 + first.month - due.month)
-        d = add_months(due, k)
+        d = add_months_anchored(due, k, anchor)
         while d <= end:
             if d >= first:
                 out.append(d)
             k += 1
-            d = add_months(due, k)
+            d = add_months_anchored(due, k, anchor)
     return out
 
 
@@ -50,7 +54,7 @@ def preview_tasks(tasks: List[TaskItem], start: date, end: date, today: date) ->
             due = datetime.strptime(t.due_date, "%Y-%m-%d").date()
         except ValueError:
             continue
-        for d in occurrence_dates(due, t.recurrence, start, end, today):
+        for d in occurrence_dates(due, t.recurrence, start, end, today, 0 if t.is_period else t.recur_day):
             ds = d.strftime("%Y-%m-%d")
             if (ds, t.title) in taken:
                 continue
@@ -73,10 +77,7 @@ def _shifted_start(t: TaskItem, due: date, new_due: date) -> str:
 
 
 def _parse(ds: str) -> Optional[date]:
-    try:
-        return datetime.strptime(ds, "%Y-%m-%d").date()
-    except (TypeError, ValueError):
-        return None
+    return parse_ymd(ds) if isinstance(ds, str) else None
 
 
 def span_dates(task: TaskItem, first: date, last: date) -> List[date]:

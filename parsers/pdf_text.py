@@ -298,7 +298,13 @@ class _Document:
                 break
         result: List[Tuple[dict, dict]] = []
 
+        visited = set()  # 같은 페이지 묶음을 여러 번 가리키는 손상·악성 PDF에서 지수적으로 도는 것 방지
+
         def walk(node_ref, inherited_res, depth=0):
+            if isinstance(node_ref, Ref):
+                if node_ref.num in visited:
+                    return
+                visited.add(node_ref.num)
             node = self.resolve(node_ref)
             if not isinstance(node, dict) or depth > 50:
                 return
@@ -510,10 +516,16 @@ def _truetype_gid_to_unicode(font: bytes) -> Dict[int, str]:
                         result.setdefault(gid, chr(code))
         elif fmt == 12:
             n_groups = struct.unpack(">I", font[base + 12:base + 16])[0]
-            for g in range(n_groups):
+            # 글리프는 최대 65,536개라 그보다 많은 대응은 손상·악성 폰트 (0~0x10FFFF 그룹 반복으로 멈추는 것 방지)
+            budget = 0x10000
+            for g in range(min(n_groups, (len(font) - base - 16) // 12)):
                 start, end, gid0 = struct.unpack(">III", font[base + 16 + 12 * g:base + 28 + 12 * g])
-                for code in range(start, min(end, 0x10FFFF) + 1):
+                end = min(end, 0x10FFFF, start + budget - 1)
+                for code in range(start, end + 1):
                     result.setdefault(gid0 + code - start, chr(code))
+                budget -= max(0, end - start + 1)
+                if budget <= 0:
+                    break
     return result
 
 
@@ -538,6 +550,9 @@ class _TextCollector:
         self.lines: List[str] = []
         self.current: List[str] = []
         self.font_cache: Dict[int, _Font] = {}
+        # Form XObject 실행 횟수 상한과 실행 중인 Form 번호 (자기 자신을 여러 번 부르는 PDF가 멈추지 않게)
+        self.form_budget = 500
+        self._form_stack: set = set()
 
     def newline(self) -> None:
         line = re.sub(r"[ \xa0　]+", " ", "".join(self.current)).strip()
@@ -654,9 +669,17 @@ class _TextCollector:
                 xobjs = self.doc.resolve(resources.get("XObject")) or {}
                 ref = xobjs.get(str(operands[-1]))
                 xobj = self.doc.resolve(ref)
-                if isinstance(xobj, dict) and xobj.get("Subtype") == "Form" and isinstance(ref, Ref):
-                    sub_res = self.doc.resolve(xobj.get("Resources")) or resources
-                    self.run(self.doc.decoded_stream(ref.num), sub_res, depth + 1)
+                if (
+                    isinstance(xobj, dict) and xobj.get("Subtype") == "Form" and isinstance(ref, Ref)
+                    and ref.num not in self._form_stack and self.form_budget > 0
+                ):
+                    self.form_budget -= 1
+                    self._form_stack.add(ref.num)
+                    try:
+                        sub_res = self.doc.resolve(xobj.get("Resources")) or resources
+                        self.run(self.doc.decoded_stream(ref.num), sub_res, depth + 1)
+                    finally:
+                        self._form_stack.discard(ref.num)
             operands = []
 
 
@@ -681,17 +704,23 @@ def extract_pdf_text_from_bytes(data: bytes) -> str:
 def _collect(data: bytes) -> Tuple[_Document, "_TextCollector", int]:
     if not data.lstrip()[:5].startswith(b"%PDF"):
         raise PDFTextError("PDF 파일이 아닙니다 (보안 프로그램(DRM)으로 잠긴 파일일 수 있음)")
-    doc = _Document(data)
-    collector = _TextCollector(doc)
-    pages = doc.pages()
-    for page, resources in pages:
-        contents = page.get("Contents")
-        refs = doc.resolve(contents)
-        if isinstance(contents, Ref) and not isinstance(refs, list):
-            refs = [contents]
-        content = b"\n".join(doc.stream_of(r) for r in (refs or []))
-        collector.run(content, resources)
-        collector.newline()
+    try:
+        doc = _Document(data)
+        collector = _TextCollector(doc)
+        pages = doc.pages()
+        for page, resources in pages:
+            contents = page.get("Contents")
+            refs = doc.resolve(contents)
+            if isinstance(contents, Ref) and not isinstance(refs, list):
+                refs = [contents]
+            content = b"\n".join(doc.stream_of(r) for r in (refs or []))
+            collector.run(content, resources if isinstance(resources, dict) else {})
+            collector.newline()
+    except PDFTextError:
+        raise
+    except (zlib.error, struct.error, TypeError, AttributeError, KeyError, IndexError, ValueError, RecursionError) as e:
+        # 손상된 압축·잘못된 객체 형식 등: 점검 화면에 이유가 보이도록 PDFTextError로 바꿈
+        raise PDFTextError(f"PDF 구조가 손상되어 읽을 수 없습니다 ({type(e).__name__})") from e
     return doc, collector, len(pages)
 
 

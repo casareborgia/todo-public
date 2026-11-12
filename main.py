@@ -6,7 +6,6 @@
   공공기관/정부기관 사내 보안솔루션 충돌 및 반입 승인 문제를 최소화
 """
 
-import json
 import os
 import sys
 
@@ -23,6 +22,7 @@ from collectors.clipboard_collector import ClipboardCollector
 from collectors.ezq_collector import EzqMessageCollector
 from collectors.workmgmt_collector import WorkMgmtDocCollector
 from collectors.folder_watcher import FolderWatcherCollector
+from core.config_store import read_config_file
 from core.database import DatabaseManager
 from parsers.portal_parser import PortalAndMessengerParser
 from parsers.rule_parser import RuleBasedExtractor
@@ -31,8 +31,7 @@ from parsers.rule_parser import RuleBasedExtractor
 def load_config(config_path: str = "config.json") -> dict:
     if os.path.isfile(config_path):
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            return read_config_file(config_path)
         except Exception:
             pass
     return {}
@@ -52,6 +51,37 @@ def set_windows_dpi_awareness() -> None:
                 ctypes.windll.user32.SetProcessDPIAware()
             except Exception:
                 pass
+
+
+_INSTANCE_MUTEX = None  # 프로그램이 끝날 때까지 들고 있어야 하는 핸들
+
+
+def acquire_single_instance(base_dir: str) -> bool:
+    """같은 폴더(같은 DB)의 프로그램이 이미 켜져 있으면 False.
+
+    두 개가 동시에 켜지면 같은 쪽지·문서를 둘 다 수집해 업무가 중복 등록되고 알림도 두 번 뜸
+    (스트레스 테스트: 쪽지 150건 중 10건 중복). 시작프로그램 등록과 바로가기를 같이 쓰면 쉽게 생김.
+    Windows가 아니거나 확인에 실패하면 막지 않음."""
+    global _INSTANCE_MUTEX
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        import hashlib
+
+        name = "Local\\TodoCalendar_" +hashlib.sha1(os.path.normcase(base_dir).encode("utf-8")).hexdigest()[:16]
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        handle = kernel32.CreateMutexW(None, False, name)
+        if not handle:
+            return True
+        if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+            return False
+        _INSTANCE_MUTEX = handle
+        return True
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def main() -> None:
@@ -99,9 +129,22 @@ def main() -> None:
         )
         return
 
+    is_startup = "--startup" in sys.argv
+    if not acquire_single_instance(BASE_DIR):
+        if not is_startup:  # 부팅 때 자동 실행이 겹친 경우는 조용히 끝냄
+            import tkinter as tk
+            from tkinter import messagebox
+
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showinfo(
+                "이미 실행 중", "투두리스트 캘린더가 이미 켜져 있습니다.\n작업 표시줄에서 열린 창을 확인해 주세요."
+            )
+            root.destroy()
+        return
+
     from ui.app_window import TodoCalendarApp
 
-    is_startup = "--startup" in sys.argv
     app = TodoCalendarApp(
         config=config,
         db=db,

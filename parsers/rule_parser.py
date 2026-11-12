@@ -86,20 +86,20 @@ ENFORCE_DATE_RE = re.compile(
 # 날짜: 연도(2026·'26)는 있어도 없어도 됨. 연도가 있을 때만 '2026-11-10'처럼 '-'로 이은 날짜를 인정
 def _period_date(p: str) -> str:
     return (
-        r"(?:(?P<" + p + r"y>20\d{2}|['‘’`]\d{2})\s*[.\-/년]\s*)?"
-        r"(?P<" + p + r"m>\d{1,2})\s*(?:[./월]|(?(" + p + r"y)-|(?!)))\s*(?P<" + p + r"d>\d{1,2})(?!\d)\s*일?\s*\.?"
+        r"(?:(?P<" + p + r"y>20\d{2}|['‘’`]\d{2})\s*+[.\-/년]\s*+)?"
+        r"(?P<" + p + r"m>\d{1,2})\s*+(?:[./월]|(?(" + p + r"y)-|(?!)))\s*+(?P<" + p + r"d>\d{1,2})(?!\d)\s*+일?\s*+\.?"
     )
 
 
-_PERIOD_WD = r"(?:\s*\(\s*[월화수목금토일]\s*\))?"
+_PERIOD_WD = r"(?:\s*+\(\s*+[월화수목금토일]\s*+\))?"
 # 끝이 일만인 기간의 끝 일 뒤에 올 수 있는 것 (message_scorer의 기간 대안도 같은 경계를 씀)
 PERIOD_DAY_END_TAIL = (
-    r"(?:\s*일)?\.?(?:\s*\(\s*[월화수목금토일]\s*\))?(?=$|\s|[,)\]]|까지|부터|이내|내)"
+    r"(?:\s*+일)?\.?(?:\s*+\(\s*+[월화수목금토일]\s*+\))?(?=$|\s|[,)\]]|까지|부터|이내|내)"
     # 띄어 쓴 단위도 수량·시각 범위 ('3~4 명', '~3 쪽'). 단위 글자로 시작하는 낱말('회신', '시행', '주시기')은 그대로 둠
-    r"(?!\s*(?:[명개시분쪽번배건회차호주년월%](?![가-힣])|[명개쪽번배호][이을를은는씩]))"
+    r"(?!\s*+(?:[명개시분쪽번배건회차호주년월%](?![가-힣])|[명개쪽번배호][이을를은는씩]))"
 )
 PERIOD_RE = re.compile(
-    r"(?<![\d.])" + _period_date("s") + _PERIOD_WD + r"\s*(?P<sep>[~∼〜\-])\s*"
+    r"(?<![\d.])" + _period_date("s") + _PERIOD_WD + r"\s*+(?P<sep>[~∼〜\-])\s*+"
     + r"(?:" + _period_date("e") + _PERIOD_WD
     # 끝이 일만 ('11/10~14', '11/28~3'): 끝 일 뒤에 빈칸·글 끝·',)]'·'까지/부터/이내/내'가 올 때만 기간
     # ('3~4명', '~3쪽', '1.5~2배', '14~16시'처럼 단위가 붙으면 수량·시각 범위)
@@ -108,6 +108,19 @@ PERIOD_RE = re.compile(
 
 # 기한을 따로 적었다는 표시 (끝이 일만인 기간 A-3을 양보할지 판단)
 DEADLINE_WORD_RE = re.compile(r"까지|마감|기한|限")
+# 상대 날짜 바로 뒤의 기한 표시 ('다음주 금요일까지', '내일 오후 3시까지', '오늘 중')
+RELATIVE_MARK_RE = re.compile(
+    r"\s*(?:\([월화수목금토일]\)\s*)?(?:(?:오전|오후)\s*)?"
+    r"(?:\d{1,2}\s*(?:시(?:\s*반|\s*\d{1,2}\s*분)?|:\d{2})\s*)?"
+    r"(?:중|까지|마감|내|안으로|이내)"
+)
+# '3.5 이상', '1.5 배', '4.5 점', '3.1 호'처럼 소수 뒤에 단위·비교어가 오면 날짜(월.일)가 아님
+#   단위 글자는 낱말로 따로 쓰였을 때만 ('11.20 회의'·'11.20 점검'·'11.20 개최'는 날짜)
+DECIMAL_UNIT_RE = re.compile(
+    r"\s*(?:이상|이하|미만|초과|%|퍼센트|kg|km|cm|mm|"
+    r"(?:배|점|호|명|개|건|원|회|차|위|등|시간|분|초)"
+    r"(?=[^가-힣]|$|(?:이|가|을|를|로|으로|씩|만|에|은|는)(?![가-힣])|(?:이상|이하|미만|초과|증가|감소|상승|하락)))"
+)
 
 # 같은 줄에 본문이 이어지는 발신자 표기 (예: '[김철수 팀장] 감사 자료 보고 바랍니다')
 INLINE_CHAT_SENDER_RE = re.compile(r"^\s*\[[가-힣]{2,4}\s*" + JOB_TITLES + r"\]")
@@ -366,13 +379,15 @@ class RuleBasedExtractor(BaseTaskExtractor):
             elif sy:
                 start = self._safe_date(sy, sm, sd)
                 end = start and self._safe_date(start.year, em, ed)
-                if start and end and end < start:
+                # 해를 넘기는 기간('2026.12.28~1.3')만 다음 해. 같은 해 안에서 거꾸로 쓴 기간은 기간이 아님
+                if start and end and end < start and em < sm:
                     end = self._safe_date(start.year + 1, em, ed)
             else:
                 # 끝 날짜를 extract_due와 같은 방법으로 정한 뒤 시작을 그 앞에 둠 ('12/28~1/3' → 2026-12-28 ~ 2027-01-03)
                 end = self._safe_date(ey, em, ed) if ey else self._resolve_month_day(today, em, ed)
                 start = end and self._safe_date(end.year, sm, sd)
-                if start and end and start > end:
+                # 해를 넘기는 기간('12/28~1/3')만 시작을 지난해로. '11/20~11/10'처럼 거꾸로 쓴 건 기간이 아님
+                if start and end and start > end and sm > em:
                     start = self._safe_date(end.year - 1, sm, sd)
         if not start or not end or end <= start:
             return None
@@ -398,7 +413,9 @@ class RuleBasedExtractor(BaseTaskExtractor):
             return self._safe_date(year, int(m.group(2)), int(m.group(3)))
 
         def md(m: "re.Match") -> Optional[date]:
-            return self._resolve_month_day(today, int(m.group(1)), int(m.group(2)))
+            # 월·일은 숫자 그룹 앞의 두 개 (규칙 C에는 구분자 그룹 'sep'이 사이에 있음)
+            month, day = [g for g in m.groups() if g and g.isdigit()][:2]
+            return self._resolve_month_day(today, int(month), int(day))
 
         # A. 범위 표현 (~ 2026.11.15 또는 ~ 11/15 까지)에서 뒷날짜(마감일) 우선 추출
         range_ymd = next((m for m in re.finditer(
@@ -450,9 +467,11 @@ class RuleBasedExtractor(BaseTaskExtractor):
         # '11.10. 3~4명'은 그대로, '증가율 3.5.'·'버전 2.1.'처럼 키워드 없는 줄 끝 소수는 날짜로 읽지 않음
         md_matches = [
             m for m in re.finditer(
-                r"(?<![0-9.])(\d{1,2})\s*(?:월|[/.])\s*(\d{1,2})\s*(?:일)?(?:\.(?=\s*(?:\([월화수목금토일]\)|까지|마감))|(?P<eol>\.)(?=[ \t]*(?:\n|$)))?(?:\s*\([월화수목금토일]\))?(?=\s*(?:까지|마감|한|내|오전|오후|\d{1,2}시|\d{1,2}:\d{2}|\([월화수목금토일]\)|$|[,\s]))",
+                r"(?<![0-9.A-Za-z])(\d{1,2})\s*(?P<sep>월|[/.])\s*(\d{1,2})\s*(?:일)?(?:\.(?=\s*(?:\([월화수목금토일]\)|까지|마감))|(?P<eol>\.)(?=[ \t]*(?:\n|$)))?(?:\s*\([월화수목금토일]\))?(?=\s*(?:까지|마감|한|내|오전|오후|\d{1,2}시|\d{1,2}:\d{2}|\([월화수목금토일]\)|$|[,\s]))",
                 chunk,
-            ) if not past(md(m)) and (not m.group("eol") or self._on_deadline_line(chunk, m.start()))
+            ) if not past(md(m))
+            and (not m.group("eol") or self._on_deadline_line(chunk, m.start()))
+            and not (m.group("sep") == "." and DECIMAL_UNIT_RE.match(chunk, m.end()))
         ]
         if md_matches:
             d = md(md_matches[-1])
@@ -460,68 +479,88 @@ class RuleBasedExtractor(BaseTaskExtractor):
                 return d
 
         # D. 상대 날짜 표현 (오늘, 내일, 모레, 금주 금요일, 차주 월요일, N일 내 등)
-        if re.search(r"(오늘|금일|당일)\s*(?:중|까지|마감|내|안으로)?", chunk):
-            return today
-        if re.search(r"(내일|명일|익일)\s*(?:중|까지|마감|오전|오후)?", chunk):
-            return today + timedelta(days=1)
-        if re.search(r"(모레|내일모레)", chunk):
-            return today + timedelta(days=2)
+        return self._relative_date(chunk, today)
 
-        in_days = re.search(r"(\d{1,2})\s*일\s*(?:이내|내로|내|안으로|뒤|후)", chunk)
-        if in_days:
-            return today + timedelta(days=int(in_days.group(1)))
+    def _relative_date(self, chunk: str, today: date) -> Optional[date]:
+        """상대 날짜 표현 중 기한으로 쓰인 것을 고른다.
+
+        한 줄에 여러 표현이 있으면('오늘 회의에서 … 다음주 금요일까지') 바로 뒤에 '까지/마감/중' 같은
+        기한 표시가 붙은 표현을 우선한다. 같은 조건이면 아래 규칙 순서(앞쪽 우선)를 따르고,
+        기한 표시 없이 쓴 '오늘/금일'은 다른 표현이 없을 때만 쓴다.
+        """
+        cands = []  # (start, end, rule_order, date, marked)
+
+        def add(m: "re.Match", order: int, d: date, marked: bool = False) -> None:
+            if not marked:
+                marked = bool(RELATIVE_MARK_RE.match(chunk, m.end()))
+            cands.append((m.start(), m.end(), order, d, marked))
+
+        for m in re.finditer(r"(?<!해)(?:오늘|금일|당일)", chunk):
+            add(m, 0, today)
+        for m in re.finditer(r"(?:내일|명일|익일)(?!\s*모레)", chunk):
+            add(m, 1, today + timedelta(days=1))
+        for m in re.finditer(r"(?:내일\s*)?모레", chunk):
+            add(m, 2, today + timedelta(days=2))
+
+        for m in re.finditer(r"(\d{1,2})\s*일\s*(?:이내|내로|내|안으로|뒤|후)", chunk):
+            add(m, 3, today + timedelta(days=int(m.group(1))), marked=True)
 
         # 다음 달 / 이번 달 N일
-        month_day = re.search(r"(다음\s*달|내달|익월|차월|이번\s*달|금월|당월)\s*(\d{1,2})\s*일", chunk)
-        if month_day:
-            is_next = not re.match(r"(이번|금월|당월)", month_day.group(1))
+        for m in re.finditer(r"(다음\s*달|내달|익월|차월|이번\s*달|금월|당월)\s*(\d{1,2})\s*일", chunk):
+            is_next = not re.match(r"(이번|금월|당월)", m.group(1))
             year, month = today.year, today.month
             if is_next:
                 year, month = (year + 1, 1) if month == 12 else (year, month + 1)
-            day = min(int(month_day.group(2)), calendar.monthrange(year, month)[1])
-            return date(year, month, day)
+            day = min(int(m.group(2)), calendar.monthrange(year, month)[1])
+            add(m, 4, date(year, month, day))
 
         # 이번 주 내로 / 다음 주 중 → 해당 주 금요일
-        week_within = re.search(r"(이번\s*주|금주|다음\s*주|차주|내주)\s*(?:내|중|안)", chunk)
-        if week_within:
-            this_friday = today + timedelta(days=4 - today.weekday())
-            if re.match(r"(이번|금주)", week_within.group(1)):
-                return max(today, this_friday)
-            return this_friday + timedelta(days=7)
+        this_friday = today + timedelta(days=4 - today.weekday())
+        for m in re.finditer(r"(이번\s*주|금주|다음\s*주|차주|내주)\s*(?:내|중|안)", chunk):
+            if re.match(r"(이번|금주)", m.group(1)):
+                add(m, 5, max(today, this_friday), marked=True)
+            else:
+                add(m, 5, this_friday + timedelta(days=7), marked=True)
 
         # 이번주 / 금주 X요일
-        this_week = re.search(r"(?:이번\s*주|금주)\s*([월화수목금토일])요일", chunk)
-        if this_week:
-            target_wd = WEEKDAY_MAP[this_week.group(1)]
-            diff = target_wd - today.weekday()
-            if diff < 0:
-                diff += 7
-            return today + timedelta(days=diff)
+        #   이미 지난 요일도 이번 주 그날 ('이번주 월요일까지'를 화요일에 받으면 어제 = 기한경과). 다음 주로 넘기지 않음
+        for m in re.finditer(r"(?:이번\s*주|금주)\s*([월화수목금토일])요일", chunk):
+            add(m, 6, today + timedelta(days=WEEKDAY_MAP[m.group(1)] - today.weekday()))
 
         # 다음주 / 차주 / 내주 X요일
-        next_week = re.search(r"(?:다음\s*주|차주|내주)\s*([월화수목금토일])요일", chunk)
-        if next_week:
-            target_wd = WEEKDAY_MAP[next_week.group(1)]
+        for m in re.finditer(r"(?:다음\s*주|차주|내주)\s*([월화수목금토일])요일", chunk):
             days_until_next_monday = 7 - today.weekday()
-            return today + timedelta(days=days_until_next_monday + target_wd)
+            add(m, 7, today + timedelta(days=days_until_next_monday + WEEKDAY_MAP[m.group(1)]))
 
         # 단독 'X요일까지' (사이에 시각이 끼는 'X요일 오전 11시까지'도 포함)
-        weekday_until = re.search(
+        for m in re.finditer(
             r"([월화수목금토일])요일\s*(?:(?:오전|오후)\s*)?"
             r"(?:\d{1,2}\s*(?:시(?:\s*반|\s*\d{1,2}\s*분)?|:\d{2})\s*)?까지",
             chunk,
-        )
-        if weekday_until:
-            target_wd = WEEKDAY_MAP[weekday_until.group(1)]
-            diff = (target_wd - today.weekday()) % 7
-            return today + timedelta(days=diff)
+        ):
+            diff = (WEEKDAY_MAP[m.group(1)] - today.weekday()) % 7
+            add(m, 8, today + timedelta(days=diff), marked=True)
 
         # 이번달 말 / 금월 말일
-        if re.search(r"(?:이번\s*달|금월|당월)\s*(?:말일|말까지|말)", chunk):
+        for m in re.finditer(r"(?:이번\s*달|금월|당월)\s*(?:말일|말까지|말)", chunk):
             last_day = calendar.monthrange(today.year, today.month)[1]
-            return date(today.year, today.month, last_day)
+            add(m, 9, date(today.year, today.month, last_day))
 
-        return None
+        if not cands:
+            return None
+        # 겹치는 표현은 먼저 시작하는(더 긴) 쪽만 남김: '다음주 금요일까지'의 '금요일까지'는 뺌
+        def shadowed(c) -> bool:
+            return any(
+                o is not c and o[0] < c[1] and c[0] < o[1]
+                and (o[0] < c[0] or (o[0] == c[0] and o[1] > c[1]))
+                for o in cands
+            )
+        cands = [c for c in cands if not shadowed(c)]
+        marked = [c for c in cands if c[4]]
+        if marked:
+            return min(marked, key=lambda c: (c[2], c[0]))[3]
+        weak = [c for c in cands if c[2] != 0]  # 기한 표시 없는 '오늘'은 맨 뒤로
+        return min(weak or cands, key=lambda c: (c[2], c[0]))[3]
 
     def _extract_time(self, text: str) -> str:
         # 1) 오전/오후 HH시 (MM분|반) or HH:MM
@@ -594,11 +633,16 @@ class RuleBasedExtractor(BaseTaskExtractor):
         candidate = self._safe_date(today.year, m, d)
         if not candidate:
             return None
-        # 만약 오늘보다 60일 이상 과거 날짜라면 내년 날짜로 보정
+        # 만약 오늘보다 60일 이상 과거 날짜라면 내년 날짜로 보정 (12월에 받은 '1/5까지' → 다음 해)
         if (today - candidate).days > 60:
             next_yr = self._safe_date(today.year + 1, m, d)
             if next_yr:
                 return next_yr
+        # 반대로 10개월 넘게 뒤라면 지난해 날짜 (1월에 받은 '12/28까지' → 지난 12월, 기한경과)
+        if (candidate - today).days > 365 - 60:
+            prev_yr = self._safe_date(today.year - 1, m, d)
+            if prev_yr:
+                return prev_yr
         return candidate
 
     def extract_title(self, text: str) -> str:

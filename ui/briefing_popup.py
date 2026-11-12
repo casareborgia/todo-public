@@ -262,7 +262,11 @@ class StartupBriefingPopup(tk.Toplevel):
         if not task:
             return
         if self.on_task_edit:
-            self.on_task_edit(task)
+            # 편집 창은 브리핑 위에 띄우고, 저장한 뒤에 브리핑 목록을 다시 읽음 (편집 창은 바로 돌아오므로 여기서 갱신하면 옛 값)
+            self.on_task_edit(task, parent=self, after_save=self._refresh_if_open)
+
+    def _refresh_if_open(self) -> None:
+        if self.winfo_exists():
             self._populate_data()
 
     def _on_double_click(self, _event) -> None:

@@ -9,6 +9,7 @@
 from datetime import datetime
 import hashlib
 import re
+import sys
 from typing import Callable, Dict, List, Optional, Tuple
 
 from collectors.base_collector import BaseCollector
@@ -39,6 +40,8 @@ def message_key(body: str) -> str:
 
 
 class EzqMessageCollector(BaseCollector):
+    MAX_RETRY = 3  # 처리 중 오류가 난 쪽지를 다시 시도하는 횟수 (계속 실패하는 쪽지가 3초마다 반복되지 않게)
+
     def __init__(
         self,
         db: DatabaseManager,
@@ -55,6 +58,8 @@ class EzqMessageCollector(BaseCollector):
         self.reader = reader
         self.clock = clock
         self._seen: Dict[str, datetime] = {}  # 이번 실행에서 이미 처리한 쪽지 → 처음 발견한 시각
+        self._first_seen: Dict[str, datetime] = {}  # 오류로 다시 시도할 쪽지 → 처음 발견한 시각
+        self._fail_count: Dict[str, int] = {}
 
     @staticmethod
     def _split(body: str) -> Tuple[str, str, List[dict]]:
@@ -118,17 +123,33 @@ class EzqMessageCollector(BaseCollector):
             key = message_key(body)
             if key in self._seen:
                 continue
-            received_at = self.clock()
+            # 실패해서 다시 시도하는 쪽지는 처음 발견한 시각을 그대로 씀 ('내일까지'의 기준)
+            received_at = self._first_seen.get(key) or self.clock()
             self._seen[key] = received_at
             if self.db.get_ezq_message(key) is not None or self.db.find_task_by_keys([f"EZQ:{key}|0"]) is not None:
                 # 이미 판정한 쪽지 (프로그램을 다시 켰을 때 열려 있던 창, 사용자가 지웠거나 '업무 아님'으로 표시한 쪽지):
                 # 다시 등록하거나 오늘 날짜로 기한을 다시 계산하지 않음
                 continue
-            judged = self.judge(body)
-            self.db.record_ezq_message(
-                key, f"{received_at:%Y-%m-%d %H:%M:%S}", judged.verdict, judged.score, judged.reasons, body.strip()
-            )
-            created += self._register(self.parse_message(body, received_at))
+            try:
+                judged = self.judge(body)
+                items = self.parse_message(body, received_at)
+                self.db.record_ezq_message(
+                    key, f"{received_at:%Y-%m-%d %H:%M:%S}", judged.verdict, judged.score, judged.reasons, body.strip()
+                )
+                created += self._register(items)
+                self._first_seen.pop(key, None)
+            except Exception as e:  # noqa: BLE001 - 한 쪽지의 오류로 다른 쪽지 수집을 멈추지 않음
+                # 판정 기록만 남고 업무가 안 생긴 채 '이미 본 쪽지'로 굳지 않게 되돌림 (DB 잠김 등 일시 오류는 다음 확인 때 다시 시도)
+                self._fail_count[key] = self._fail_count.get(key, 0) + 1
+                print(f"[EzQ] 쪽지 처리 오류 ({self._fail_count[key]}회): {e!r}", file=sys.stderr)
+                if self._fail_count[key] < self.MAX_RETRY:
+                    self._seen.pop(key, None)
+                    self._first_seen[key] = received_at
+                    try:
+                        if self.db.find_task_by_ezq_key(key) is None:
+                            self.db.forget_ezq_message(key)
+                    except Exception:  # noqa: BLE001
+                        pass
         return created
 
     def _register(self, items: List[TaskItem], merge_similar: bool = True) -> List[TaskItem]:

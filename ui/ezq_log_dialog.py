@@ -282,7 +282,7 @@ class EzqReviewDialog(tk.Toplevel):
         tk.Label(frame, text="❔ 확인 필요", font=(FONT, 13, "bold"), bg=BG, fg="#0F172A").pack(anchor="w")
         tk.Label(
             frame,
-            text="업무인지 애매한 쪽지·문서(기한·첨부·공문 없는 요청)와 업무관리자로 지정된 배부 문서입니다. 정리하기 전까지 캘린더·알림에 나오지 않습니다.",
+            text="업무인지 애매한 쪽지·문서(기한·첨부·공문 없는 요청)와 아직 열어 보지 않은 배부 문서입니다. 배부 문서는 열면 본문으로 판정됩니다. 정리하기 전까지 캘린더·알림에 나오지 않습니다.",
             font=(FONT, 8),
             bg=BG,
             fg="#64748B",
